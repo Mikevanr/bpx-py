@@ -448,15 +448,14 @@ class PointsFarmer:
             return
 
         position = state.position
-        current_price = fill_price or self._last_prices.get(symbol, position.entry_price)
+        close_price = fill_price or self._last_prices.get(symbol, position.entry_price)
 
-        # Calculate P/L
+        # Calculate P/L using actual prices and quantity
         if position.side == Side.LONG:
-            pnl = (current_price - position.entry_price) / position.entry_price
+            pnl_usdc = (close_price - position.entry_price) * position.quantity
         else:
-            pnl = (position.entry_price - current_price) / position.entry_price
+            pnl_usdc = (position.entry_price - close_price) * position.quantity
 
-        pnl_usdc = pnl * position.notional
         volume = position.notional * 2  # Entry + exit
 
         # Update stats
@@ -469,9 +468,9 @@ class PointsFarmer:
         pnl_sign = "+" if pnl_usdc >= 0 else ""
         print(
             f"CLOSE {symbol} (TP_FILL) | "
+            f"Entry={position.entry_price:.2f} Close={close_price:.2f} | "
             f"P/L={pnl_sign}{pnl_usdc:.2f} USDC | "
-            f"Volume={volume:,.0f} | "
-            f"Points~{volume:,.0f}"
+            f"Volume={volume:,.0f}"
         )
 
         # Clear position
@@ -771,7 +770,7 @@ class PointsFarmer:
             # Close with market order
             close_side = "Ask" if position.side == Side.LONG else "Bid"
 
-            await self.account.execute_order(
+            result = await self.account.execute_order(
                 symbol=symbol,
                 side=close_side,
                 order_type="Market",
@@ -779,14 +778,24 @@ class PointsFarmer:
                 reduce_only=True,
             )
 
-            # Calculate P/L using Backpack price (where we're trading)
-            current_price = self._backpack_prices.get(symbol) or self._last_prices.get(symbol, position.entry_price)
-            if position.side == Side.LONG:
-                pnl = (current_price - position.entry_price) / position.entry_price
-            else:
-                pnl = (position.entry_price - current_price) / position.entry_price
+            # Get actual fill price from the order result
+            close_price = None
+            if isinstance(result, dict):
+                # Try to get the average fill price from the order
+                close_price = result.get("price") or result.get("avgPrice")
+                if close_price:
+                    close_price = float(close_price)
 
-            pnl_usdc = pnl * position.notional
+            # Fall back to cached price if no fill price returned
+            if not close_price:
+                close_price = self._backpack_prices.get(symbol) or self._last_prices.get(symbol, position.entry_price)
+
+            # Calculate P/L using actual prices
+            if position.side == Side.LONG:
+                pnl_usdc = (close_price - position.entry_price) * position.quantity
+            else:
+                pnl_usdc = (position.entry_price - close_price) * position.quantity
+
             volume = position.notional * 2  # Entry + exit
 
             # Update stats
@@ -804,9 +813,9 @@ class PointsFarmer:
             pnl_sign = "+" if pnl_usdc >= 0 else ""
             print(
                 f"CLOSE {symbol} ({reason}) | "
+                f"Entry={position.entry_price:.2f} Close={close_price:.2f} | "
                 f"P/L={pnl_sign}{pnl_usdc:.2f} USDC | "
-                f"Volume={volume:,.0f} | "
-                f"Points~{volume:,.0f}"
+                f"Volume={volume:,.0f}"
             )
 
             # Clear position
@@ -921,8 +930,36 @@ class PointsFarmer:
                     else:
                         # No pending entry - check if position is still open
                         if abs(actual_size) < 0.00001:
-                            # Position was closed externally
-                            print(f"[{symbol}] Position closed externally, clearing state")
+                            # Position was closed externally (likely TP filled)
+                            position = state.position
+
+                            # Estimate P/L using current market price
+                            close_price = self._backpack_prices.get(symbol) or self._last_prices.get(symbol)
+                            if close_price and position.entry_price:
+                                if position.side == Side.LONG:
+                                    pnl_usdc = (close_price - position.entry_price) * position.quantity
+                                else:
+                                    pnl_usdc = (position.entry_price - close_price) * position.quantity
+
+                                volume = position.notional * 2
+
+                                # Update stats
+                                state.cumulative_pnl += pnl_usdc
+                                self.stats.total_pnl += pnl_usdc
+                                self.stats.total_volume += volume
+                                self.stats.total_points += volume
+                                self.stats.total_trades += 1
+
+                                pnl_sign = "+" if pnl_usdc >= 0 else ""
+                                print(
+                                    f"CLOSE {symbol} (EXTERNAL) | "
+                                    f"Entry={position.entry_price:.2f} Close~{close_price:.2f} | "
+                                    f"P/L={pnl_sign}{pnl_usdc:.2f} USDC | "
+                                    f"Volume={volume:,.0f}"
+                                )
+                            else:
+                                print(f"[{symbol}] Position closed externally (no price data)")
+
                             state.position = None
 
                 # Case 2: No tracked position but Backpack has one - adopt it!
