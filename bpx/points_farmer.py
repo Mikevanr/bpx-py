@@ -62,7 +62,7 @@ BINANCE_TICKERS: Dict[str, str] = {
 BINANCE_TO_BACKPACK: Dict[str, str] = {v: k for k, v in BINANCE_TICKERS.items()}
 
 # Trading parameters
-WICK_THRESHOLD = 0.001  # 0.1% price move (user's setting)
+WICK_THRESHOLD = 0.0005  # 0.05% price move - lower for more frequent signals
 WICK_WINDOW_SECONDS = 2.0  # Time window for wick detection
 LEVERAGE_USAGE = 0.30  # Use 30% of max leverage
 NUM_SYMBOLS = len(LEVERAGE)  # Number of trading pairs
