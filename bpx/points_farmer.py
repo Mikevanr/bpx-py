@@ -71,6 +71,7 @@ NUM_SYMBOLS = len(LEVERAGE)  # Number of trading pairs
 TP_PERCENT = 0.001  # 0.1% take profit
 SL_PERCENT = 0.002  # 0.2% stop loss
 PROFIT_TIMEOUT_SECONDS = 30  # Close profitable position after 30s
+MIN_PROFIT_FOR_TIMEOUT = 0.0005  # 0.05% minimum profit to trigger timeout (avoid false positives)
 
 # Safety parameters
 COOLDOWN_SECONDS = 2  # Cooldown per symbol after trade attempt (reduced for more activity)
@@ -721,21 +722,32 @@ class PointsFarmer:
             # Opposite side for closing
             close_side = "Ask" if position.side == Side.LONG else "Bid"
 
+            # Round TP price properly
+            tp_price = self._round_price(symbol, position.tp_price)
+
             result = await self.account.execute_order(
                 symbol=symbol,
                 side=close_side,
                 order_type="Limit",
                 quantity=str(position.quantity),
-                price=str(position.tp_price),
-                post_only=True,
+                price=str(tp_price),
                 reduce_only=True,
                 time_in_force="GTC",
+                # NOTE: Removed post_only=True - if TP price is already matchable, let it fill!
             )
 
             if isinstance(result, dict) and result.get("id"):
+                order_status = result.get("status", "")
                 position.tp_order_id = result["id"]
-                if self.debug:
-                    print(f"[{symbol}] TP order placed: {result['id']}")
+
+                if order_status == "Filled":
+                    # TP filled immediately - great!
+                    print(f"[{symbol}] TP order filled immediately at {tp_price}")
+                elif self.debug:
+                    print(f"[{symbol}] TP order placed: {result['id']} at {tp_price}")
+            else:
+                error_msg = result.get('message', result) if isinstance(result, dict) else result
+                print(f"[{symbol}] TP order failed: {error_msg}")
 
         except Exception as e:
             print(f"TP order error {symbol}: {e}")
@@ -844,18 +856,20 @@ class PointsFarmer:
                             print(f"[{symbol}] SL HIT: price {current_price:.2f} <= SL {position.sl_price:.2f}")
                             await self._close_position_market(symbol, position, "SL")
                             continue
-                        in_profit = current_price > position.entry_price
+                        profit_pct = (current_price - position.entry_price) / position.entry_price
                     else:
                         if current_price >= position.sl_price:
                             print(f"[{symbol}] SL HIT: price {current_price:.2f} >= SL {position.sl_price:.2f}")
                             await self._close_position_market(symbol, position, "SL")
                             continue
-                        in_profit = current_price < position.entry_price
+                        profit_pct = (position.entry_price - current_price) / position.entry_price
 
-                    # Check profit timeout
-                    if in_profit:
+                    # Check profit timeout - only if profit exceeds minimum threshold
+                    # This prevents closing positions that are barely in profit (noise)
+                    if profit_pct >= MIN_PROFIT_FOR_TIMEOUT:
                         time_held = time.time() - position.entry_time
                         if time_held >= PROFIT_TIMEOUT_SECONDS:
+                            print(f"[{symbol}] PROFIT TIMEOUT: {profit_pct*100:.3f}% profit after {time_held:.0f}s")
                             await self._close_position_market(
                                 symbol, position, "PROFIT_TIMEOUT"
                             )
