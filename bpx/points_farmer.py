@@ -73,7 +73,7 @@ SL_PERCENT = 0.002  # 0.2% stop loss
 PROFIT_TIMEOUT_SECONDS = 30  # Close profitable position after 30s
 
 # Safety parameters
-COOLDOWN_SECONDS = 5  # Increased cooldown per symbol after trade attempt
+COOLDOWN_SECONDS = 2  # Cooldown per symbol after trade attempt (reduced for more activity)
 MAX_LOSS_PER_SYMBOL = -15.0  # Pause symbol if cumulative loss exceeds this
 STALE_ORDER_TIMEOUT = 5  # Cancel unfilled orders after 5 seconds (faster cycling)
 MAX_PRICE_DEVIATION = 0.02  # 2% max deviation from Binance price
@@ -524,7 +524,7 @@ class PointsFarmer:
     # =========================================================================
 
     async def _enter_position(self, symbol: str, side: Side) -> None:
-        """Place a maker-only limit entry order."""
+        """Place a limit entry order - aggressive pricing for better fill rates."""
         state = self.states[symbol]
 
         # Set cooldown immediately to prevent duplicate signals
@@ -571,13 +571,16 @@ class PointsFarmer:
                 print(f"[{symbol}] Price deviation too high: {price_diff*100:.2f}%")
                 return
 
-            # Place order AT the best price to maximize fill chance while staying maker
-            # For LONG: Place at best bid (we're joining the bid queue)
-            # For SHORT: Place at best ask (we're joining the ask queue)
+            # AGGRESSIVE PRICING: Place order to CROSS the spread for faster fills
+            # This will likely be a taker order, but guarantees execution
+            # For LONG: Place slightly ABOVE best ask (buy aggressively)
+            # For SHORT: Place slightly BELOW best bid (sell aggressively)
             if side == Side.LONG:
-                entry_price = best_bid
-            else:
+                # Place bid at best ask level to get filled immediately
                 entry_price = best_ask
+            else:
+                # Place ask at best bid level to get filled immediately
+                entry_price = best_bid
 
             # Round price to appropriate precision
             entry_price = self._round_price(symbol, entry_price)
@@ -603,64 +606,84 @@ class PointsFarmer:
 
             print(f"[{symbol}] Placing {side_str} {quantity} @ ${entry_price:.2f} (bid={best_bid:.2f}, ask={best_ask:.2f})")
 
+            # Use IOC (Immediate or Cancel) for aggressive fills - order fills immediately or cancels
             result = await self.account.execute_order(
                 symbol=symbol,
                 side=order_side,
                 order_type="Limit",
                 quantity=str(quantity),
                 price=str(entry_price),
-                post_only=True,
-                time_in_force="GTC",
+                time_in_force="IOC",  # Immediate or Cancel for fast execution
             )
 
-            # Check for "would immediately match" error and retry with adjusted price
-            if isinstance(result, dict):
-                error_msg = result.get('message', '')
-                if 'immediately match' in str(error_msg).lower():
-                    # Adjust price to be more conservative (further from spread)
-                    if side == Side.LONG:
-                        entry_price = self._round_price(symbol, best_bid * 0.9999)  # Slightly lower bid
-                    else:
-                        entry_price = self._round_price(symbol, best_ask * 1.0001)  # Slightly higher ask
+            if isinstance(result, dict) and result.get("id"):
+                order_id = result["id"]
+                order_status = result.get("status", "")
+                executed_qty = float(result.get("executedQuantity", 0) or 0)
 
-                    print(f"[{symbol}] Retrying with adjusted price: ${entry_price:.2f}")
-                    result = await self.account.execute_order(
+                # IOC orders fill immediately or cancel - check status
+                if order_status == "Filled" or executed_qty > 0:
+                    # Order filled! Get actual fill price if available
+                    fill_price = float(result.get("price", entry_price) or entry_price)
+
+                    # Calculate TP and SL prices
+                    if side == Side.LONG:
+                        tp_price = fill_price * (1 + TP_PERCENT)
+                        sl_price = fill_price * (1 - SL_PERCENT)
+                    else:
+                        tp_price = fill_price * (1 - TP_PERCENT)
+                        sl_price = fill_price * (1 + SL_PERCENT)
+
+                    # Create position (it's already filled!)
+                    state.position = Position(
                         symbol=symbol,
-                        side=order_side,
-                        order_type="Limit",
-                        quantity=str(quantity),
-                        price=str(entry_price),
-                        post_only=True,
-                        time_in_force="GTC",
+                        side=side,
+                        entry_price=fill_price,
+                        quantity=executed_qty if executed_qty > 0 else quantity,
+                        entry_time=time.time(),
+                        order_id=order_id,
+                        tp_price=tp_price,
+                        sl_price=sl_price,
+                        notional=notional,
                     )
 
-            if isinstance(result, dict) and result.get("id"):
-                state.pending_entry_order_id = result["id"]
-                state.pending_entry_time = time.time()
+                    print(f"*** ENTRY FILLED {symbol} {side_str} {state.position.quantity:.6f} @ {fill_price:.2f} ***")
+                    print(f"    TP @ {tp_price:.2f}, SL @ {sl_price:.2f}")
 
-                # Calculate TP and SL prices
-                if side == Side.LONG:
-                    tp_price = entry_price * (1 + TP_PERCENT)
-                    sl_price = entry_price * (1 - SL_PERCENT)
+                    # Place TP order immediately
+                    await self._place_tp_order(symbol, state.position)
+
+                    # Update stats for the entry
+                    self.stats.total_volume += notional
+                    self.stats.total_points += notional
+
+                elif order_status == "Cancelled" or order_status == "Expired":
+                    print(f"[{symbol}] IOC order not filled (status: {order_status})")
                 else:
-                    tp_price = entry_price * (1 - TP_PERCENT)
-                    sl_price = entry_price * (1 + SL_PERCENT)
+                    # Order might be pending - set up tracking just in case
+                    state.pending_entry_order_id = order_id
+                    state.pending_entry_time = time.time()
 
-                # Store pending position info
-                state.position = Position(
-                    symbol=symbol,
-                    side=side,
-                    entry_price=entry_price,
-                    quantity=quantity,
-                    entry_time=time.time(),
-                    order_id=result["id"],
-                    tp_price=tp_price,
-                    sl_price=sl_price,
-                    notional=notional,
-                )
+                    # Calculate TP and SL prices
+                    if side == Side.LONG:
+                        tp_price = entry_price * (1 + TP_PERCENT)
+                        sl_price = entry_price * (1 - SL_PERCENT)
+                    else:
+                        tp_price = entry_price * (1 - TP_PERCENT)
+                        sl_price = entry_price * (1 + SL_PERCENT)
 
-                print(f"ENTRY {symbol} {side_str} {quantity:.6f} @ {entry_price:.2f}")
-                print(f"  [{symbol}] TP @ {tp_price:.2f}, SL @ {sl_price:.2f}")
+                    state.position = Position(
+                        symbol=symbol,
+                        side=side,
+                        entry_price=entry_price,
+                        quantity=quantity,
+                        entry_time=time.time(),
+                        order_id=order_id,
+                        tp_price=tp_price,
+                        sl_price=sl_price,
+                        notional=notional,
+                    )
+                    print(f"[{symbol}] Order placed, waiting for fill (status: {order_status})")
             else:
                 error_msg = result.get('message', result) if isinstance(result, dict) else result
                 print(f"[{symbol}] Order failed: {error_msg}")
