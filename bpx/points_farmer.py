@@ -684,8 +684,8 @@ class PointsFarmer:
                 reduce_only=True,
             )
 
-            # Calculate P/L
-            current_price = self._last_prices.get(symbol, position.entry_price)
+            # Calculate P/L using Backpack price (where we're trading)
+            current_price = self._backpack_prices.get(symbol) or self._last_prices.get(symbol, position.entry_price)
             if position.side == Side.LONG:
                 pnl = (current_price - position.entry_price) / position.entry_price
             else:
@@ -788,9 +788,6 @@ class PointsFarmer:
         try:
             positions = await self.account.get_open_positions()
 
-            if self.debug:
-                print(f"[SYNC] Got positions response: {positions}")
-
             if not isinstance(positions, list):
                 if self.debug:
                     print(f"[SYNC] Positions not a list: {type(positions)}")
@@ -800,23 +797,39 @@ class PointsFarmer:
             actual_positions: Dict[str, Dict] = {}
             for pos in positions:
                 symbol = pos.get("symbol")
-                if symbol:
+                if symbol and symbol in LEVERAGE:
                     actual_positions[symbol] = pos
 
             # Check each tracked symbol
             for symbol, state in self.states.items():
                 actual = actual_positions.get(symbol)
-                actual_size = float(actual.get("netSize", 0)) if actual else 0
+                actual_size = float(actual.get("netQuantity", 0)) if actual else 0
 
-                # If we think we have a position but Backpack says we don't
-                if state.position and not state.pending_entry_order_id:
-                    if abs(actual_size) < 0.00001:
-                        # Position was closed externally (TP filled, liquidation, etc.)
-                        print(f"[{symbol}] Position closed externally, clearing state")
-                        state.position = None
+                # Case 1: We have a tracked position
+                if state.position:
+                    # If there's a pending entry, check if it's now filled
+                    if state.pending_entry_order_id:
+                        if abs(actual_size) > 0.00001:
+                            # Position exists on Backpack - entry was filled!
+                            actual_entry = float(actual.get("entryPrice", 0))
+                            print(f"*** ENTRY CONFIRMED {symbol}: qty={actual_size:.6f} @ {actual_entry:.2f} ***")
+                            state.pending_entry_order_id = None
+                            state.pending_entry_time = None
+                            # Update position with actual fill data
+                            state.position.entry_price = actual_entry
+                            state.position.quantity = abs(actual_size)
+                            state.position.entry_time = time.time()
+                            # Place TP order
+                            await self._place_tp_order(symbol, state.position)
+                    else:
+                        # No pending entry - check if position is still open
+                        if abs(actual_size) < 0.00001:
+                            # Position was closed externally
+                            print(f"[{symbol}] Position closed externally, clearing state")
+                            state.position = None
 
-                # If we don't have a tracked position but Backpack says we do - adopt it!
-                if not state.position and abs(actual_size) > 0.00001:
+                # Case 2: No tracked position but Backpack has one - adopt it!
+                elif abs(actual_size) > 0.00001:
                     await self._adopt_position(symbol, actual)
 
         except Exception as e:
@@ -829,36 +842,61 @@ class PointsFarmer:
             print(f"Checking for existing positions...")
 
             if not isinstance(positions, list):
-                print(f"No positions found (response: {positions})")
+                print(f"No positions found (response type: {type(positions)})")
                 return
 
+            found_count = 0
             for pos in positions:
                 symbol = pos.get("symbol")
                 if symbol and symbol in LEVERAGE:
-                    net_size = float(pos.get("netSize", 0))
-                    if abs(net_size) > 0.00001:
+                    # Use netQuantity (the actual field from API)
+                    net_qty = float(pos.get("netQuantity", 0))
+                    if abs(net_qty) > 0.00001:
+                        found_count += 1
                         await self._adopt_position(symbol, pos)
+
+            if found_count == 0:
+                print("No existing positions to adopt")
+            else:
+                print(f"Adopted {found_count} existing position(s)")
 
         except Exception as e:
             print(f"Error detecting existing positions: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def _adopt_position(self, symbol: str, pos_data: Dict) -> None:
         """Adopt an existing position from Backpack into our tracking state."""
         try:
             state = self.states.get(symbol)
             if not state:
+                print(f"[{symbol}] Cannot adopt - symbol not in tracked states")
                 return
 
-            net_size = float(pos_data.get("netSize", 0))
+            # Already tracking a position for this symbol
+            if state.position:
+                print(f"[{symbol}] Cannot adopt - already tracking a position")
+                return
+
+            # Use netQuantity (the actual field name from Backpack API)
+            net_qty = float(pos_data.get("netQuantity", 0))
             entry_price = float(pos_data.get("entryPrice", 0))
-            notional_value = float(pos_data.get("notionalValue", 0)) or abs(net_size * entry_price)
 
-            if abs(net_size) < 0.00001:
+            # Calculate notional from netExposureNotional or compute it
+            notional_value = float(pos_data.get("netExposureNotional", 0))
+            if not notional_value:
+                notional_value = abs(net_qty * entry_price)
+
+            if abs(net_qty) < 0.00001:
                 return
 
-            # Determine side based on net size
-            side = Side.LONG if net_size > 0 else Side.SHORT
-            quantity = abs(net_size)
+            if entry_price <= 0:
+                print(f"[{symbol}] Cannot adopt - invalid entry price: {entry_price}")
+                return
+
+            # Determine side based on net quantity (positive = long, negative = short)
+            side = Side.LONG if net_qty > 0 else Side.SHORT
+            quantity = abs(net_qty)
 
             # Calculate TP and SL prices based on entry
             if side == Side.LONG:
@@ -867,6 +905,10 @@ class PointsFarmer:
             else:
                 tp_price = entry_price * (1 - TP_PERCENT)
                 sl_price = entry_price * (1 + SL_PERCENT)
+
+            # Round prices
+            tp_price = self._round_price(symbol, tp_price)
+            sl_price = self._round_price(symbol, sl_price)
 
             # Create position object
             state.position = Position(
@@ -881,14 +923,16 @@ class PointsFarmer:
             )
 
             side_str = "Long" if side == Side.LONG else "Short"
-            print(f"*** ADOPTED EXISTING POSITION: {symbol} {side_str} {quantity:.6f} @ {entry_price:.2f} ***")
-            print(f"  [{symbol}] TP @ {tp_price:.2f}, SL @ {sl_price:.2f}")
+            print(f"*** ADOPTED POSITION: {symbol} {side_str} {quantity:.6f} @ {entry_price:.2f} ***")
+            print(f"    TP @ {tp_price:.2f}, SL @ {sl_price:.2f}, Notional: ${notional_value:.2f}")
 
             # Place TP order for the adopted position
             await self._place_tp_order(symbol, state.position)
 
         except Exception as e:
             print(f"Error adopting position {symbol}: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def _order_cleanup_loop(self) -> None:
         """Cancel stale unfilled entry orders."""
