@@ -23,7 +23,7 @@ import json
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, Optional, List, Callable, Any
+from typing import Dict, Optional, List, Any
 from enum import Enum
 
 import aiohttp
@@ -47,13 +47,13 @@ LEVERAGE: Dict[str, int] = {
 }
 
 # Map Backpack symbols to Binance stream names
+# Note: Some symbols may not have Binance futures equivalents
 BINANCE_TICKERS: Dict[str, str] = {
     "BTC_USDC_PERP": "btcusdt",
     "ETH_USDC_PERP": "ethusdt",
     "SOL_USDC_PERP": "solusdt",
     "ZEC_USDC_PERP": "zecusdt",
-    "2Z_USDT_PERP": "2zusdt",
-    "MON_USD_PERP": "monusdt",
+    # 2Z and MON don't have Binance futures - will use spot or skip
 }
 
 # Reverse mapping: Binance ticker -> Backpack symbol
@@ -63,7 +63,7 @@ BINANCE_TO_BACKPACK: Dict[str, str] = {v: k for k, v in BINANCE_TICKERS.items()}
 WICK_THRESHOLD = 0.003  # 0.3% price move
 WICK_WINDOW_SECONDS = 1.0  # Time window for wick detection
 LEVERAGE_USAGE = 0.30  # Use 30% of max leverage
-NUM_SYMBOLS = 6  # Number of trading pairs
+NUM_SYMBOLS = len(LEVERAGE)  # Number of trading pairs
 
 # Exit parameters
 TP_PERCENT = 0.001  # 0.1% take profit
@@ -75,8 +75,8 @@ COOLDOWN_SECONDS = 3  # Cooldown per symbol after trade
 MAX_LOSS_PER_SYMBOL = -15.0  # Pause symbol if cumulative loss exceeds this
 STALE_ORDER_TIMEOUT = 10  # Cancel unfilled orders after 10 seconds
 
-# Binance WebSocket
-BINANCE_WS_URL = "wss://fstream.binance.com/ws"
+# Binance WebSocket - use combined stream endpoint
+BINANCE_WS_URL = "wss://fstream.binance.com/stream"
 
 
 # =============================================================================
@@ -125,6 +125,7 @@ class Stats:
     total_points: float = 0.0
     total_pnl: float = 0.0
     total_trades: int = 0
+    wicks_detected: int = 0
 
 
 # =============================================================================
@@ -167,6 +168,9 @@ class PointsFarmer:
         self._orderbooks: Dict[str, Dict] = {}
         self._last_prices: Dict[str, float] = {}
 
+        # Track message count for debugging
+        self._msg_count = 0
+
     async def run(self) -> None:
         """Main entry point - runs the bot forever."""
         self._running = True
@@ -174,6 +178,7 @@ class PointsFarmer:
         print("BACKPACK POINTS FARMER")
         print("=" * 60)
         print(f"Trading pairs: {list(LEVERAGE.keys())}")
+        print(f"Binance feeds: {list(BINANCE_TICKERS.values())}")
         print(f"Wick threshold: {WICK_THRESHOLD * 100}%")
         print(f"TP: {TP_PERCENT * 100}% | SL: {SL_PERCENT * 100}%")
         print("=" * 60)
@@ -214,15 +219,20 @@ class PointsFarmer:
 
     async def _binance_stream_loop(self) -> None:
         """Connect to Binance and process trade stream."""
+        # Build combined stream URL correctly
         streams = [f"{ticker}@aggTrade" for ticker in BINANCE_TICKERS.values()]
-        stream_url = f"{BINANCE_WS_URL}/{'/'.join(streams)}"
+        streams_param = "/".join(streams)
+        stream_url = f"{BINANCE_WS_URL}?streams={streams_param}"
+
+        if self.debug:
+            print(f"Connecting to: {stream_url}")
 
         while self._running:
             try:
                 self._session = aiohttp.ClientSession()
                 async with self._session.ws_connect(stream_url) as ws:
                     self._binance_ws = ws
-                    print("Connected to Binance stream")
+                    print(f"Connected to Binance stream ({len(BINANCE_TICKERS)} feeds)")
 
                     async for msg in ws:
                         if not self._running:
@@ -236,7 +246,7 @@ class PointsFarmer:
 
             except Exception as e:
                 if self._running:
-                    print(f"Binance connection error: {e}, reconnecting...")
+                    print(f"Binance connection error: {e}, reconnecting in 5s...")
                     await asyncio.sleep(5)
             finally:
                 if self._session:
@@ -247,14 +257,15 @@ class PointsFarmer:
         """Process a Binance trade message."""
         try:
             msg = json.loads(data)
+            self._msg_count += 1
 
-            # Handle combined stream format
+            # Handle combined stream format: {"stream":"btcusdt@aggTrade","data":{...}}
             if "stream" in msg:
                 stream = msg["stream"]
                 ticker = stream.split("@")[0]
                 trade_data = msg["data"]
             else:
-                # Single stream format
+                # Single stream format (fallback)
                 ticker = msg.get("s", "").lower()
                 trade_data = msg
 
@@ -271,11 +282,16 @@ class PointsFarmer:
             state.prices.append(PricePoint(timestamp, price))
             self._last_prices[symbol] = price
 
+            # Debug: log first few messages
+            if self.debug and self._msg_count <= 5:
+                print(f"[{symbol}] Price: {price}")
+
             # Check for wick
             await self._check_wick(symbol, state)
 
-        except (json.JSONDecodeError, KeyError, ValueError):
-            pass  # Silently ignore malformed messages
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            if self.debug:
+                print(f"Parse error: {e}")
 
     async def _check_wick(self, symbol: str, state: SymbolState) -> None:
         """Check if a wick signal has occurred."""
@@ -301,18 +317,22 @@ class PointsFarmer:
         if len(window_prices) < 2:
             return
 
-        # Calculate price change
+        # Calculate price change from oldest to newest in window
         oldest_price = window_prices[0].price
         newest_price = window_prices[-1].price
         price_change = (newest_price - oldest_price) / oldest_price
 
         # Detect wick direction
         if abs(price_change) >= WICK_THRESHOLD:
+            self.stats.wicks_detected += 1
+            direction = "DROP" if price_change < 0 else "SPIKE"
+            print(f"[{symbol}] WICK {direction}: {price_change*100:.2f}%")
+
             if price_change < 0:
-                # Price dropped -> go Long
+                # Price dropped -> go Long (buy the dip)
                 await self._enter_position(symbol, Side.LONG)
             else:
-                # Price spiked -> go Short
+                # Price spiked -> go Short (fade the pump)
                 await self._enter_position(symbol, Side.SHORT)
 
     # =========================================================================
@@ -329,12 +349,16 @@ class PointsFarmer:
 
             if side == Side.LONG:
                 # Buy at best bid
-                if not depth.get("bids"):
+                if not depth.get("bids") or len(depth["bids"]) == 0:
+                    if self.debug:
+                        print(f"[{symbol}] No bids in orderbook")
                     return
                 entry_price = float(depth["bids"][0][0])
             else:
                 # Sell at best ask
-                if not depth.get("asks"):
+                if not depth.get("asks") or len(depth["asks"]) == 0:
+                    if self.debug:
+                        print(f"[{symbol}] No asks in orderbook")
                     return
                 entry_price = float(depth["asks"][0][0])
 
@@ -350,10 +374,15 @@ class PointsFarmer:
             quantity = self._round_quantity(symbol, quantity)
 
             if quantity <= 0:
+                if self.debug:
+                    print(f"[{symbol}] Quantity too small: {quantity}")
                 return
 
             # Place maker-only limit order
             order_side = "Bid" if side == Side.LONG else "Ask"
+
+            if self.debug:
+                print(f"[{symbol}] Placing {order_side} {quantity} @ {entry_price}")
 
             result = await self.account.execute_order(
                 symbol=symbol,
@@ -394,10 +423,12 @@ class PointsFarmer:
                 side_str = "Long" if side == Side.LONG else "Short"
                 print(f"ENTRY {symbol} {side_str} {quantity:.6f} @ {entry_price:.2f}")
                 print(f"  [{symbol}] TP @ {tp_price:.2f}, SL @ {sl_price:.2f}")
+            else:
+                if self.debug:
+                    print(f"[{symbol}] Order failed: {result}")
 
         except Exception as e:
-            if self.debug:
-                print(f"Entry error {symbol}: {e}")
+            print(f"Entry error {symbol}: {e}")
 
     async def _place_tp_order(self, symbol: str, position: Position) -> None:
         """Place take-profit limit order."""
@@ -418,10 +449,11 @@ class PointsFarmer:
 
             if isinstance(result, dict) and result.get("id"):
                 position.tp_order_id = result["id"]
+                if self.debug:
+                    print(f"[{symbol}] TP order placed: {result['id']}")
 
         except Exception as e:
-            if self.debug:
-                print(f"TP order error {symbol}: {e}")
+            print(f"TP order error {symbol}: {e}")
 
     async def _close_position_market(
         self, symbol: str, position: Position, reason: str
@@ -485,8 +517,7 @@ class PointsFarmer:
             state.pending_entry_order_id = None
 
         except Exception as e:
-            if self.debug:
-                print(f"Close error {symbol}: {e}")
+            print(f"Close error {symbol}: {e}")
 
     # =========================================================================
     # Position Monitoring
@@ -566,8 +597,7 @@ class PointsFarmer:
                             await self.account.cancel_order(
                                 symbol=symbol, order_id=state.pending_entry_order_id
                             )
-                            if self.debug:
-                                print(f"Cancelled stale order {symbol}")
+                            print(f"[{symbol}] Cancelled stale entry order")
                         except Exception:
                             pass
 
@@ -583,17 +613,88 @@ class PointsFarmer:
 
     async def _stats_printer_loop(self) -> None:
         """Print periodic stats."""
-        while self._running:
-            await asyncio.sleep(60)  # Every minute
+        last_debug_print = 0
 
-            print("-" * 60)
+        while self._running:
+            await asyncio.sleep(5)  # Check every 5 seconds
+
+            now = time.time()
+
+            # Print price changes every 10 seconds
+            if now - last_debug_print >= 10:
+                last_debug_print = now
+                self._print_price_changes()
+
+    def _print_price_changes(self) -> None:
+        """Print price changes for all symbols over different timeframes."""
+        now = time.time()
+
+        print("-" * 70)
+        print(f"{'Symbol':<16} {'Price':>10} {'1s':>8} {'10s':>8} {'1m':>8}")
+        print("-" * 70)
+
+        for symbol in BINANCE_TICKERS.keys():
+            state = self.states[symbol]
+            current_price = self._last_prices.get(symbol)
+
+            if not current_price or len(state.prices) == 0:
+                print(f"{symbol:<16} {'no data':>10}")
+                continue
+
+            # Calculate changes for different timeframes
+            change_1s = self._calc_price_change(state.prices, now, 1.0)
+            change_10s = self._calc_price_change(state.prices, now, 10.0)
+            change_1m = self._calc_price_change(state.prices, now, 60.0)
+
+            # Format output
+            def fmt_change(c):
+                if c is None:
+                    return "n/a"
+                color_prefix = ""
+                if abs(c) >= WICK_THRESHOLD:
+                    color_prefix = "**"  # Highlight potential wick
+                return f"{color_prefix}{c*100:+.3f}%"
+
+            short_symbol = symbol.replace("_USDC_PERP", "").replace("_USDT_PERP", "").replace("_USD_PERP", "")
             print(
-                f"STATS | Trades: {self.stats.total_trades} | "
-                f"Volume: ${self.stats.total_volume:,.0f} | "
-                f"Points: ~{self.stats.total_points:,.0f} | "
-                f"P/L: ${self.stats.total_pnl:+.2f}"
+                f"{short_symbol:<16} "
+                f"${current_price:>9.2f} "
+                f"{fmt_change(change_1s):>8} "
+                f"{fmt_change(change_10s):>8} "
+                f"{fmt_change(change_1m):>8}"
             )
-            print("-" * 60)
+
+        # Print summary stats
+        print("-" * 70)
+        print(
+            f"Msgs: {self._msg_count:,} | "
+            f"Wicks: {self.stats.wicks_detected} | "
+            f"Trades: {self.stats.total_trades} | "
+            f"Volume: ${self.stats.total_volume:,.0f} | "
+            f"P/L: ${self.stats.total_pnl:+.2f}"
+        )
+        print("-" * 70)
+
+    def _calc_price_change(self, prices: deque, now: float, seconds: float) -> Optional[float]:
+        """Calculate price change over the given time window."""
+        if len(prices) < 2:
+            return None
+
+        # Find oldest price within the window
+        oldest_in_window = None
+        for p in prices:
+            if now - p.timestamp <= seconds:
+                oldest_in_window = p
+                break
+
+        if oldest_in_window is None:
+            return None
+
+        newest = prices[-1]
+        if oldest_in_window.timestamp == newest.timestamp:
+            return 0.0
+
+        return (newest.price - oldest_in_window.price) / oldest_in_window.price
 
     # =========================================================================
     # Helpers
@@ -635,7 +736,7 @@ async def main():
         print("Error: Set BPX_PUBLIC_KEY and BPX_SECRET_KEY environment variables")
         return
 
-    bot = PointsFarmer(public_key, secret_key, debug=False)
+    bot = PointsFarmer(public_key, secret_key, debug=True)
     await bot.run()
 
 
