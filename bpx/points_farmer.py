@@ -10,6 +10,8 @@ Features:
 - Maker-only entries with 0.1% TP and 0.2% SL
 - Auto-closes on SL hit or 30-second profit timeout
 - Tracks volume and estimated points per trade
+- Uses Backpack private websocket for real-time fill detection
+- Compares Binance and Backpack prices for optimal entry
 
 Usage:
     from bpx.points_farmer import PointsFarmer
@@ -30,6 +32,7 @@ import aiohttp
 
 from bpx.async_.account import Account
 from bpx.async_.public import Public
+from bpx.async_.private_websocket import PrivateWebsocket
 
 
 # =============================================================================
@@ -166,10 +169,17 @@ class PointsFarmer:
 
         # Market data cache
         self._orderbooks: Dict[str, Dict] = {}
-        self._last_prices: Dict[str, float] = {}
+        self._last_prices: Dict[str, float] = {}  # Binance prices
+        self._backpack_prices: Dict[str, float] = {}  # Backpack prices
 
         # Track message count for debugging
         self._msg_count = 0
+
+        # Private websocket for real-time order/position updates
+        self._private_ws: Optional[PrivateWebsocket] = None
+
+        # Track filled orders for logging
+        self._pending_fills: Dict[str, Dict] = {}  # order_id -> order info
 
     async def run(self) -> None:
         """Main entry point - runs the bot forever."""
@@ -188,14 +198,20 @@ class PointsFarmer:
             balances = await self.account.get_balances()
             usdc_balance = self._get_usdc_balance(balances)
             print(f"Starting USDC balance: ${usdc_balance:.2f}")
+
+            # Connect to Backpack private websocket for real-time updates
+            await self._connect_private_websocket()
+            print("Connected to Backpack private websocket")
             print("=" * 60)
 
             # Run main loops concurrently
             await asyncio.gather(
                 self._binance_stream_loop(),
+                self._backpack_price_loop(),
                 self._position_monitor_loop(),
                 self._order_cleanup_loop(),
                 self._stats_printer_loop(),
+                self._private_ws_loop(),
             )
         except KeyboardInterrupt:
             print("\nShutting down gracefully...")
@@ -212,6 +228,8 @@ class PointsFarmer:
             await self._binance_ws.close()
         if self._session:
             await self._session.close()
+        if self._private_ws:
+            await self._private_ws.disconnect()
 
     # =========================================================================
     # Binance Signal Detection
@@ -293,6 +311,173 @@ class PointsFarmer:
             if self.debug:
                 print(f"Parse error: {e}")
 
+    # =========================================================================
+    # Backpack Price & Private Websocket
+    # =========================================================================
+
+    async def _backpack_price_loop(self) -> None:
+        """Fetch Backpack prices periodically to compare with Binance."""
+        while self._running:
+            try:
+                tickers = await self.public.get_tickers()
+                if isinstance(tickers, list):
+                    for ticker in tickers:
+                        symbol = ticker.get("symbol")
+                        if symbol in LEVERAGE:
+                            last_price = ticker.get("lastPrice")
+                            if last_price:
+                                self._backpack_prices[symbol] = float(last_price)
+                elif isinstance(tickers, dict):
+                    for symbol, data in tickers.items():
+                        if symbol in LEVERAGE:
+                            last_price = data.get("lastPrice")
+                            if last_price:
+                                self._backpack_prices[symbol] = float(last_price)
+            except Exception as e:
+                if self.debug:
+                    print(f"Backpack price fetch error: {e}")
+            await asyncio.sleep(1)  # Update every second
+
+    async def _connect_private_websocket(self) -> None:
+        """Connect to Backpack private websocket for real-time order/position updates."""
+        import base64
+        # Get the base64 encoded secret key
+        private_bytes = self.account.private_key.private_bytes_raw()
+        secret_key_b64 = base64.b64encode(private_bytes).decode()
+
+        self._private_ws = PrivateWebsocket(
+            public_key=self.public_key,
+            secret_key=secret_key_b64,
+            debug=self.debug,
+        )
+        await self._private_ws.connect()
+
+        # Subscribe to order and position updates
+        await self._private_ws.subscribe_order_updates(self._handle_order_update)
+        await self._private_ws.subscribe_position_updates(self._handle_position_update)
+
+    async def _private_ws_loop(self) -> None:
+        """Run the private websocket listener."""
+        if self._private_ws:
+            try:
+                await self._private_ws.listen()
+            except Exception as e:
+                if self._running:
+                    print(f"Private websocket error: {e}, reconnecting...")
+                    await asyncio.sleep(5)
+                    await self._connect_private_websocket()
+                    await self._private_ws_loop()
+
+    async def _handle_order_update(self, message: Dict[str, Any]) -> None:
+        """Handle real-time order updates from Backpack."""
+        try:
+            data = message.get("data", {})
+            order_id = data.get("id")
+            status = data.get("status")
+            symbol = data.get("symbol")
+            side = data.get("side")
+            filled_qty = data.get("executedQuantity", "0")
+            price = data.get("price", "0")
+
+            if self.debug:
+                print(f"[WS ORDER] {symbol} {status}: {side} {filled_qty} @ {price}")
+
+            if status == "Filled":
+                state = self.states.get(symbol)
+                if state and state.pending_entry_order_id == order_id:
+                    # Entry order filled
+                    print(f"*** ENTRY FILLED {symbol} {side} {filled_qty} @ {price} ***")
+                    state.pending_entry_order_id = None
+                    if state.position:
+                        state.position.entry_time = time.time()
+                        state.position.entry_price = float(price) if price else state.position.entry_price
+                        # Place TP order
+                        await self._place_tp_order(symbol, state.position)
+
+                elif state and state.position and state.position.tp_order_id == order_id:
+                    # TP order filled
+                    await self._handle_tp_fill(symbol, state, float(price) if price else None)
+
+            elif status == "Cancelled":
+                state = self.states.get(symbol)
+                if state:
+                    if state.pending_entry_order_id == order_id:
+                        state.pending_entry_order_id = None
+                        state.pending_entry_time = None
+                        state.position = None
+                        if self.debug:
+                            print(f"[{symbol}] Entry order cancelled")
+                    elif state.position and state.position.tp_order_id == order_id:
+                        state.position.tp_order_id = None
+                        if self.debug:
+                            print(f"[{symbol}] TP order cancelled")
+
+        except Exception as e:
+            if self.debug:
+                print(f"Order update error: {e}")
+
+    async def _handle_position_update(self, message: Dict[str, Any]) -> None:
+        """Handle real-time position updates from Backpack."""
+        try:
+            data = message.get("data", {})
+            symbol = data.get("symbol")
+            position_size = float(data.get("netSize", 0))
+            entry_price = float(data.get("entryPrice", 0))
+            unrealized_pnl = float(data.get("unrealizedPnl", 0))
+
+            if self.debug:
+                print(f"[WS POS] {symbol}: size={position_size}, entry={entry_price}, uPnL={unrealized_pnl}")
+
+            state = self.states.get(symbol)
+            if not state:
+                return
+
+            # Position closed (size is now 0)
+            if abs(position_size) < 0.00001 and state.position:
+                # Position was closed (either by TP, SL, or manual)
+                if self.debug:
+                    print(f"[{symbol}] Position closed detected via websocket")
+
+        except Exception as e:
+            if self.debug:
+                print(f"Position update error: {e}")
+
+    async def _handle_tp_fill(self, symbol: str, state: SymbolState, fill_price: Optional[float]) -> None:
+        """Handle take-profit fill."""
+        if not state.position:
+            return
+
+        position = state.position
+        current_price = fill_price or self._last_prices.get(symbol, position.entry_price)
+
+        # Calculate P/L
+        if position.side == Side.LONG:
+            pnl = (current_price - position.entry_price) / position.entry_price
+        else:
+            pnl = (position.entry_price - current_price) / position.entry_price
+
+        pnl_usdc = pnl * position.notional
+        volume = position.notional * 2  # Entry + exit
+
+        # Update stats
+        state.cumulative_pnl += pnl_usdc
+        self.stats.total_pnl += pnl_usdc
+        self.stats.total_volume += volume
+        self.stats.total_points += volume
+        self.stats.total_trades += 1
+
+        pnl_sign = "+" if pnl_usdc >= 0 else ""
+        print(
+            f"CLOSE {symbol} (TP_FILL) | "
+            f"P/L={pnl_sign}{pnl_usdc:.2f} USDC | "
+            f"Volume={volume:,.0f} | "
+            f"Points~{volume:,.0f}"
+        )
+
+        # Clear position
+        state.position = None
+        state.pending_entry_order_id = None
+
     async def _check_wick(self, symbol: str, state: SymbolState) -> None:
         """Check if a wick signal has occurred."""
         if state.paused or state.position:
@@ -347,23 +532,41 @@ class PointsFarmer:
         state.last_trade_time = time.time()
 
         try:
-            # ALWAYS use Binance price as the reference (more reliable than orderbook)
+            # Get both Binance and Backpack prices
             binance_price = self._last_prices.get(symbol)
+            backpack_price = self._backpack_prices.get(symbol)
+
             if not binance_price:
                 print(f"[{symbol}] No Binance price available")
                 return
 
-            # Calculate entry price based on Binance price
-            # Use small offset to ensure maker order (won't immediately match)
+            if not backpack_price:
+                # Fall back to Binance if Backpack price not available yet
+                backpack_price = binance_price
+                print(f"[{symbol}] Using Binance price as fallback (no Backpack price)")
+
+            # Check price deviation between exchanges
+            price_diff = abs(backpack_price - binance_price) / binance_price
+            if price_diff > MAX_PRICE_DEVIATION:
+                print(f"[{symbol}] Price deviation too high: {price_diff*100:.2f}% (Binance: {binance_price:.2f}, Backpack: {backpack_price:.2f})")
+                return
+
+            # USE BACKPACK PRICE for entry (this is where orders will execute!)
+            # Place orders slightly inside the spread to get filled
             if side == Side.LONG:
-                # Place bid slightly below current price
-                entry_price = binance_price * (1 - 0.0002)  # 0.02% below
+                # Place bid slightly below Backpack's current price to be a maker
+                # But close enough to get filled on the next price move
+                entry_price = backpack_price * (1 - 0.0001)  # 0.01% below Backpack price
             else:
-                # Place ask slightly above current price
-                entry_price = binance_price * (1 + 0.0002)  # 0.02% above
+                # Place ask slightly above Backpack's current price
+                entry_price = backpack_price * (1 + 0.0001)  # 0.01% above Backpack price
 
             # Round price to appropriate precision
             entry_price = self._round_price(symbol, entry_price)
+
+            # Log price comparison for debugging
+            if self.debug:
+                print(f"[{symbol}] Binance: ${binance_price:.2f}, Backpack: ${backpack_price:.2f}, Entry: ${entry_price:.2f}")
 
             # Calculate position size
             balances = await self.account.get_balances()
@@ -384,7 +587,7 @@ class PointsFarmer:
             order_side = "Bid" if side == Side.LONG else "Ask"
             side_str = "Long" if side == Side.LONG else "Short"
 
-            print(f"[{symbol}] Placing {side_str} {quantity} @ ${entry_price:.2f} (Binance: ${binance_price:.2f})")
+            print(f"[{symbol}] Placing {side_str} {quantity} @ ${entry_price:.2f} (Binance: ${binance_price:.2f}, Backpack: ${backpack_price:.2f})")
 
             result = await self.account.execute_order(
                 symbol=symbol,
@@ -525,43 +728,44 @@ class PointsFarmer:
 
     async def _position_monitor_loop(self) -> None:
         """Monitor positions for SL hits and profit timeouts."""
+        last_position_check = 0
+
         while self._running:
             try:
+                # Periodically poll actual positions from Backpack to sync state
+                now = time.time()
+                if now - last_position_check >= 2:  # Check every 2 seconds
+                    last_position_check = now
+                    await self._sync_positions()
+
                 for symbol, state in self.states.items():
                     if not state.position:
                         continue
 
                     position = state.position
-                    current_price = self._last_prices.get(symbol)
 
+                    # Use Backpack price for SL/TP checks (that's where we're trading!)
+                    current_price = self._backpack_prices.get(symbol)
+                    if not current_price:
+                        # Fall back to Binance price
+                        current_price = self._last_prices.get(symbol)
                     if not current_price:
                         continue
 
-                    # Check if entry order is filled (position is active)
+                    # Skip SL/TP checks if entry order is still pending
                     if state.pending_entry_order_id:
-                        # Check order status
-                        try:
-                            order = await self.account.get_open_order(
-                                symbol=symbol, order_id=state.pending_entry_order_id
-                            )
-                            if not order or order.get("status") == "Filled":
-                                # Entry filled, place TP
-                                state.pending_entry_order_id = None
-                                position.entry_time = time.time()
-                                await self._place_tp_order(symbol, position)
-                        except Exception:
-                            # Order might be filled or cancelled
-                            state.pending_entry_order_id = None
                         continue
 
-                    # Check SL
+                    # Check SL using Backpack price
                     if position.side == Side.LONG:
                         if current_price <= position.sl_price:
+                            print(f"[{symbol}] SL HIT: price {current_price:.2f} <= SL {position.sl_price:.2f}")
                             await self._close_position_market(symbol, position, "SL")
                             continue
                         in_profit = current_price > position.entry_price
                     else:
                         if current_price >= position.sl_price:
+                            print(f"[{symbol}] SL HIT: price {current_price:.2f} >= SL {position.sl_price:.2f}")
                             await self._close_position_market(symbol, position, "SL")
                             continue
                         in_profit = current_price < position.entry_price
@@ -579,6 +783,43 @@ class PointsFarmer:
                     print(f"Monitor error: {e}")
 
             await asyncio.sleep(0.1)
+
+    async def _sync_positions(self) -> None:
+        """Sync local state with actual positions on Backpack."""
+        try:
+            positions = await self.account.get_open_positions()
+            if not isinstance(positions, list):
+                return
+
+            # Build map of actual positions
+            actual_positions: Dict[str, Dict] = {}
+            for pos in positions:
+                symbol = pos.get("symbol")
+                if symbol:
+                    actual_positions[symbol] = pos
+
+            # Check each tracked symbol
+            for symbol, state in self.states.items():
+                actual = actual_positions.get(symbol)
+                actual_size = float(actual.get("netSize", 0)) if actual else 0
+
+                # If we think we have a position but Backpack says we don't
+                if state.position and not state.pending_entry_order_id:
+                    if abs(actual_size) < 0.00001:
+                        # Position was closed externally (TP filled, liquidation, etc.)
+                        if self.debug:
+                            print(f"[{symbol}] Position closed externally, clearing state")
+                        state.position = None
+
+                # If we don't think we have a position but Backpack says we do
+                # (This shouldn't happen normally, but let's log it)
+                if not state.position and abs(actual_size) > 0.00001:
+                    if self.debug:
+                        print(f"[{symbol}] Unexpected position found: size={actual_size}")
+
+        except Exception as e:
+            if self.debug:
+                print(f"Sync positions error: {e}")
 
     async def _order_cleanup_loop(self) -> None:
         """Cancel stale unfilled entry orders."""
@@ -629,17 +870,24 @@ class PointsFarmer:
         """Print price changes for all symbols over different timeframes."""
         now = time.time()
 
-        print("-" * 70)
-        print(f"{'Symbol':<16} {'Price':>10} {'1s':>8} {'10s':>8} {'1m':>8}")
-        print("-" * 70)
+        print("-" * 85)
+        print(f"{'Symbol':<10} {'Binance':>11} {'Backpack':>11} {'Diff':>8} {'1s':>8} {'10s':>8} {'1m':>8}")
+        print("-" * 85)
 
         for symbol in BINANCE_TICKERS.keys():
             state = self.states[symbol]
-            current_price = self._last_prices.get(symbol)
+            binance_price = self._last_prices.get(symbol)
+            backpack_price = self._backpack_prices.get(symbol)
 
-            if not current_price or len(state.prices) == 0:
-                print(f"{symbol:<16} {'no data':>10}")
+            if not binance_price or len(state.prices) == 0:
+                print(f"{symbol:<10} {'no data':>11}")
                 continue
+
+            # Calculate price difference between exchanges
+            price_diff = ""
+            if backpack_price and binance_price:
+                diff_pct = (backpack_price - binance_price) / binance_price * 100
+                price_diff = f"{diff_pct:+.3f}%"
 
             # Calculate changes for different timeframes
             change_1s = self._calc_price_change(state.prices, now, 1.0)
@@ -656,16 +904,19 @@ class PointsFarmer:
                 return f"{color_prefix}{c*100:+.3f}%"
 
             short_symbol = symbol.replace("_USDC_PERP", "").replace("_USDT_PERP", "").replace("_USD_PERP", "")
+            bp_str = f"${backpack_price:>.2f}" if backpack_price else "n/a"
             print(
-                f"{short_symbol:<16} "
-                f"${current_price:>9.2f} "
+                f"{short_symbol:<10} "
+                f"${binance_price:>10.2f} "
+                f"{bp_str:>11} "
+                f"{price_diff:>8} "
                 f"{fmt_change(change_1s):>8} "
                 f"{fmt_change(change_10s):>8} "
                 f"{fmt_change(change_1m):>8}"
             )
 
         # Print summary stats
-        print("-" * 70)
+        print("-" * 85)
         print(
             f"Msgs: {self._msg_count:,} | "
             f"Wicks: {self.stats.wicks_detected} | "
@@ -673,7 +924,7 @@ class PointsFarmer:
             f"Volume: ${self.stats.total_volume:,.0f} | "
             f"P/L: ${self.stats.total_pnl:+.2f}"
         )
-        print("-" * 70)
+        print("-" * 85)
 
     def _calc_price_change(self, prices: deque, now: float, seconds: float) -> Optional[float]:
         """Calculate price change over the given time window."""
