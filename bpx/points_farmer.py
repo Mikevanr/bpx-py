@@ -75,7 +75,7 @@ PROFIT_TIMEOUT_SECONDS = 30  # Close profitable position after 30s
 # Safety parameters
 COOLDOWN_SECONDS = 5  # Increased cooldown per symbol after trade attempt
 MAX_LOSS_PER_SYMBOL = -15.0  # Pause symbol if cumulative loss exceeds this
-STALE_ORDER_TIMEOUT = 10  # Cancel unfilled orders after 10 seconds
+STALE_ORDER_TIMEOUT = 5  # Cancel unfilled orders after 5 seconds (faster cycling)
 MAX_PRICE_DEVIATION = 0.02  # 2% max deviation from Binance price
 
 # Binance WebSocket - use combined stream endpoint
@@ -533,39 +533,54 @@ class PointsFarmer:
         try:
             # Get both Binance and Backpack prices
             binance_price = self._last_prices.get(symbol)
-            backpack_price = self._backpack_prices.get(symbol)
 
             if not binance_price:
                 print(f"[{symbol}] No Binance price available")
                 return
 
-            if not backpack_price:
-                # Fall back to Binance if Backpack price not available yet
-                backpack_price = binance_price
-                print(f"[{symbol}] Using Binance price as fallback (no Backpack price)")
+            # Fetch orderbook to get actual bid/ask prices
+            try:
+                depth = await self.public.get_depth(symbol)
+                if not depth or "bids" not in depth or "asks" not in depth:
+                    print(f"[{symbol}] Could not get orderbook")
+                    return
 
-            # Check price deviation between exchanges
-            price_diff = abs(backpack_price - binance_price) / binance_price
-            if price_diff > MAX_PRICE_DEVIATION:
-                print(f"[{symbol}] Price deviation too high: {price_diff*100:.2f}% (Binance: {binance_price:.2f}, Backpack: {backpack_price:.2f})")
+                bids = depth.get("bids", [])
+                asks = depth.get("asks", [])
+
+                if not bids or not asks:
+                    print(f"[{symbol}] Empty orderbook")
+                    return
+
+                # Best bid is highest buy price, best ask is lowest sell price
+                best_bid = float(bids[0][0])
+                best_ask = float(asks[0][0])
+                spread = (best_ask - best_bid) / best_bid * 100
+
+                if self.debug:
+                    print(f"[{symbol}] Orderbook: bid={best_bid:.2f}, ask={best_ask:.2f}, spread={spread:.4f}%")
+
+            except Exception as e:
+                print(f"[{symbol}] Error fetching orderbook: {e}")
                 return
 
-            # USE BACKPACK PRICE for entry (this is where orders will execute!)
-            # Place orders slightly inside the spread to get filled
+            # Check price deviation between Binance and Backpack mid
+            backpack_mid = (best_bid + best_ask) / 2
+            price_diff = abs(backpack_mid - binance_price) / binance_price
+            if price_diff > MAX_PRICE_DEVIATION:
+                print(f"[{symbol}] Price deviation too high: {price_diff*100:.2f}%")
+                return
+
+            # Place order AT the best price to maximize fill chance while staying maker
+            # For LONG: Place at best bid (we're joining the bid queue)
+            # For SHORT: Place at best ask (we're joining the ask queue)
             if side == Side.LONG:
-                # Place bid slightly below Backpack's current price to be a maker
-                # But close enough to get filled on the next price move
-                entry_price = backpack_price * (1 - 0.0001)  # 0.01% below Backpack price
+                entry_price = best_bid
             else:
-                # Place ask slightly above Backpack's current price
-                entry_price = backpack_price * (1 + 0.0001)  # 0.01% above Backpack price
+                entry_price = best_ask
 
             # Round price to appropriate precision
             entry_price = self._round_price(symbol, entry_price)
-
-            # Log price comparison for debugging
-            if self.debug:
-                print(f"[{symbol}] Binance: ${binance_price:.2f}, Backpack: ${backpack_price:.2f}, Entry: ${entry_price:.2f}")
 
             # Calculate position size
             balances = await self.account.get_balances()
@@ -586,7 +601,7 @@ class PointsFarmer:
             order_side = "Bid" if side == Side.LONG else "Ask"
             side_str = "Long" if side == Side.LONG else "Short"
 
-            print(f"[{symbol}] Placing {side_str} {quantity} @ ${entry_price:.2f} (Binance: ${binance_price:.2f}, Backpack: ${backpack_price:.2f})")
+            print(f"[{symbol}] Placing {side_str} {quantity} @ ${entry_price:.2f} (bid={best_bid:.2f}, ask={best_ask:.2f})")
 
             result = await self.account.execute_order(
                 symbol=symbol,
@@ -597,6 +612,27 @@ class PointsFarmer:
                 post_only=True,
                 time_in_force="GTC",
             )
+
+            # Check for "would immediately match" error and retry with adjusted price
+            if isinstance(result, dict):
+                error_msg = result.get('message', '')
+                if 'immediately match' in str(error_msg).lower():
+                    # Adjust price to be more conservative (further from spread)
+                    if side == Side.LONG:
+                        entry_price = self._round_price(symbol, best_bid * 0.9999)  # Slightly lower bid
+                    else:
+                        entry_price = self._round_price(symbol, best_ask * 1.0001)  # Slightly higher ask
+
+                    print(f"[{symbol}] Retrying with adjusted price: ${entry_price:.2f}")
+                    result = await self.account.execute_order(
+                        symbol=symbol,
+                        side=order_side,
+                        order_type="Limit",
+                        quantity=str(quantity),
+                        price=str(entry_price),
+                        post_only=True,
+                        time_in_force="GTC",
+                    )
 
             if isinstance(result, dict) and result.get("id"):
                 state.pending_entry_order_id = result["id"]
