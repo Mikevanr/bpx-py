@@ -357,18 +357,23 @@ class PointsFarmer:
             # Get orderbook for best price
             depth = await self.public.get_depth(symbol)
 
+            if self.debug:
+                # Log full orderbook response to debug symbol mismatch
+                top_bids = depth.get("bids", [])[:3] if depth.get("bids") else []
+                top_asks = depth.get("asks", [])[:3] if depth.get("asks") else []
+                print(f"[{symbol}] Orderbook - Bids: {top_bids}, Asks: {top_asks}")
+                print(f"[{symbol}] Binance price: ${binance_price:.2f}")
+
             if side == Side.LONG:
                 # Buy at best bid
                 if not depth.get("bids") or len(depth["bids"]) == 0:
-                    if self.debug:
-                        print(f"[{symbol}] No bids in orderbook")
+                    print(f"[{symbol}] No bids in orderbook")
                     return
                 book_price = float(depth["bids"][0][0])
             else:
                 # Sell at best ask
                 if not depth.get("asks") or len(depth["asks"]) == 0:
-                    if self.debug:
-                        print(f"[{symbol}] No asks in orderbook")
+                    print(f"[{symbol}] No asks in orderbook")
                     return
                 book_price = float(depth["asks"][0][0])
 
