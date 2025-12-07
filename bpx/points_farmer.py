@@ -552,17 +552,41 @@ class PointsFarmer:
                     print(f"[{symbol}] Empty orderbook")
                     return
 
-                # Best bid is highest buy price, best ask is lowest sell price
-                best_bid = float(bids[0][0])
-                best_ask = float(asks[0][0])
+                # Explicitly find the HIGHEST bid and LOWEST ask
+                # (orderbook might not be sorted correctly)
+                bid_prices = [float(b[0]) for b in bids if float(b[0]) > 0]
+                ask_prices = [float(a[0]) for a in asks if float(a[0]) > 0]
+
+                if not bid_prices or not ask_prices:
+                    print(f"[{symbol}] No valid bid/ask prices")
+                    return
+
+                best_bid = max(bid_prices)  # Highest bid
+                best_ask = min(ask_prices)  # Lowest ask
+
+                # Sanity check: best_bid should be less than best_ask
+                if best_bid >= best_ask:
+                    print(f"[{symbol}] Invalid orderbook: bid {best_bid} >= ask {best_ask}")
+                    # Fall back to Binance price
+                    best_bid = binance_price * 0.9999
+                    best_ask = binance_price * 1.0001
+
                 spread = (best_ask - best_bid) / best_bid * 100
+
+                # Sanity check: spread should be reasonable (< 1%)
+                if spread > 1.0:
+                    print(f"[{symbol}] Wide spread {spread:.2f}%, using Binance price")
+                    best_bid = binance_price * 0.9999
+                    best_ask = binance_price * 1.0001
+                    spread = 0.02
 
                 if self.debug:
                     print(f"[{symbol}] Orderbook: bid={best_bid:.2f}, ask={best_ask:.2f}, spread={spread:.4f}%")
 
             except Exception as e:
-                print(f"[{symbol}] Error fetching orderbook: {e}")
-                return
+                print(f"[{symbol}] Error fetching orderbook: {e}, using Binance price")
+                best_bid = binance_price * 0.9999
+                best_ask = binance_price * 1.0001
 
             # Check price deviation between Binance and Backpack mid
             backpack_mid = (best_bid + best_ask) / 2
