@@ -202,6 +202,9 @@ class PointsFarmer:
             # Connect to Backpack private websocket for real-time updates
             await self._connect_private_websocket()
             print("Connected to Backpack private websocket")
+
+            # Detect and adopt any existing positions
+            await self._detect_existing_positions()
             print("=" * 60)
 
             # Run main loops concurrently
@@ -784,7 +787,13 @@ class PointsFarmer:
         """Sync local state with actual positions on Backpack."""
         try:
             positions = await self.account.get_open_positions()
+
+            if self.debug:
+                print(f"[SYNC] Got positions response: {positions}")
+
             if not isinstance(positions, list):
+                if self.debug:
+                    print(f"[SYNC] Positions not a list: {type(positions)}")
                 return
 
             # Build map of actual positions
@@ -803,19 +812,83 @@ class PointsFarmer:
                 if state.position and not state.pending_entry_order_id:
                     if abs(actual_size) < 0.00001:
                         # Position was closed externally (TP filled, liquidation, etc.)
-                        if self.debug:
-                            print(f"[{symbol}] Position closed externally, clearing state")
+                        print(f"[{symbol}] Position closed externally, clearing state")
                         state.position = None
 
-                # If we don't think we have a position but Backpack says we do
-                # (This shouldn't happen normally, but let's log it)
+                # If we don't have a tracked position but Backpack says we do - adopt it!
                 if not state.position and abs(actual_size) > 0.00001:
-                    if self.debug:
-                        print(f"[{symbol}] Unexpected position found: size={actual_size}")
+                    await self._adopt_position(symbol, actual)
 
         except Exception as e:
-            if self.debug:
-                print(f"Sync positions error: {e}")
+            print(f"Sync positions error: {e}")
+
+    async def _detect_existing_positions(self) -> None:
+        """Detect and adopt any existing positions on startup."""
+        try:
+            positions = await self.account.get_open_positions()
+            print(f"Checking for existing positions...")
+
+            if not isinstance(positions, list):
+                print(f"No positions found (response: {positions})")
+                return
+
+            for pos in positions:
+                symbol = pos.get("symbol")
+                if symbol and symbol in LEVERAGE:
+                    net_size = float(pos.get("netSize", 0))
+                    if abs(net_size) > 0.00001:
+                        await self._adopt_position(symbol, pos)
+
+        except Exception as e:
+            print(f"Error detecting existing positions: {e}")
+
+    async def _adopt_position(self, symbol: str, pos_data: Dict) -> None:
+        """Adopt an existing position from Backpack into our tracking state."""
+        try:
+            state = self.states.get(symbol)
+            if not state:
+                return
+
+            net_size = float(pos_data.get("netSize", 0))
+            entry_price = float(pos_data.get("entryPrice", 0))
+            notional_value = float(pos_data.get("notionalValue", 0)) or abs(net_size * entry_price)
+
+            if abs(net_size) < 0.00001:
+                return
+
+            # Determine side based on net size
+            side = Side.LONG if net_size > 0 else Side.SHORT
+            quantity = abs(net_size)
+
+            # Calculate TP and SL prices based on entry
+            if side == Side.LONG:
+                tp_price = entry_price * (1 + TP_PERCENT)
+                sl_price = entry_price * (1 - SL_PERCENT)
+            else:
+                tp_price = entry_price * (1 - TP_PERCENT)
+                sl_price = entry_price * (1 + SL_PERCENT)
+
+            # Create position object
+            state.position = Position(
+                symbol=symbol,
+                side=side,
+                entry_price=entry_price,
+                quantity=quantity,
+                entry_time=time.time(),  # We don't know actual entry time
+                tp_price=tp_price,
+                sl_price=sl_price,
+                notional=notional_value,
+            )
+
+            side_str = "Long" if side == Side.LONG else "Short"
+            print(f"*** ADOPTED EXISTING POSITION: {symbol} {side_str} {quantity:.6f} @ {entry_price:.2f} ***")
+            print(f"  [{symbol}] TP @ {tp_price:.2f}, SL @ {sl_price:.2f}")
+
+            # Place TP order for the adopted position
+            await self._place_tp_order(symbol, state.position)
+
+        except Exception as e:
+            print(f"Error adopting position {symbol}: {e}")
 
     async def _order_cleanup_loop(self) -> None:
         """Cancel stale unfilled entry orders."""
