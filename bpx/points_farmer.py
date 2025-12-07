@@ -343,7 +343,17 @@ class PointsFarmer:
         """Place a maker-only limit entry order."""
         state = self.states[symbol]
 
+        # Set cooldown immediately to prevent duplicate signals
+        state.last_trade_time = time.time()
+
         try:
+            # Get reference price from Binance
+            binance_price = self._last_prices.get(symbol)
+            if not binance_price:
+                if self.debug:
+                    print(f"[{symbol}] No Binance price available")
+                return
+
             # Get orderbook for best price
             depth = await self.public.get_depth(symbol)
 
@@ -353,14 +363,29 @@ class PointsFarmer:
                     if self.debug:
                         print(f"[{symbol}] No bids in orderbook")
                     return
-                entry_price = float(depth["bids"][0][0])
+                book_price = float(depth["bids"][0][0])
             else:
                 # Sell at best ask
                 if not depth.get("asks") or len(depth["asks"]) == 0:
                     if self.debug:
                         print(f"[{symbol}] No asks in orderbook")
                     return
-                entry_price = float(depth["asks"][0][0])
+                book_price = float(depth["asks"][0][0])
+
+            # Validate: book price should be within 5% of Binance price
+            price_deviation = abs(book_price - binance_price) / binance_price
+            if price_deviation > 0.05:
+                print(f"[{symbol}] WARNING: Orderbook price ${book_price:.2f} differs from Binance ${binance_price:.2f} by {price_deviation*100:.1f}%")
+                # Use Binance price with small offset instead
+                if side == Side.LONG:
+                    entry_price = binance_price * 0.9995  # Slightly below for maker
+                else:
+                    entry_price = binance_price * 1.0005  # Slightly above for maker
+            else:
+                entry_price = book_price
+
+            # Round price to appropriate precision
+            entry_price = self._round_price(symbol, entry_price)
 
             # Calculate position size
             balances = await self.account.get_balances()
@@ -382,7 +407,7 @@ class PointsFarmer:
             order_side = "Bid" if side == Side.LONG else "Ask"
 
             if self.debug:
-                print(f"[{symbol}] Placing {order_side} {quantity} @ {entry_price}")
+                print(f"[{symbol}] Placing {order_side} {quantity} @ {entry_price} (Binance: {binance_price:.2f})")
 
             result = await self.account.execute_order(
                 symbol=symbol,
@@ -397,7 +422,6 @@ class PointsFarmer:
             if isinstance(result, dict) and result.get("id"):
                 state.pending_entry_order_id = result["id"]
                 state.pending_entry_time = time.time()
-                state.last_trade_time = time.time()
 
                 # Calculate TP and SL prices
                 if side == Side.LONG:
@@ -719,6 +743,19 @@ class PointsFarmer:
             return round(quantity, 4)
         else:
             return round(quantity, 3)
+
+    def _round_price(self, symbol: str, price: float) -> float:
+        """Round price based on symbol tick size."""
+        if "BTC" in symbol:
+            return round(price, 1)  # $0.1 tick
+        elif "ETH" in symbol:
+            return round(price, 2)  # $0.01 tick
+        elif "SOL" in symbol:
+            return round(price, 2)  # $0.01 tick
+        elif "ZEC" in symbol:
+            return round(price, 2)  # $0.01 tick
+        else:
+            return round(price, 4)  # Default
 
 
 # =============================================================================
