@@ -37,31 +37,30 @@ from bpx.async_.public import Public
 # =============================================================================
 
 # Trading pairs and their leverage
+# NOTE: Only include pairs with good liquidity on Backpack
 LEVERAGE: Dict[str, int] = {
     "BTC_USDC_PERP": 50,
     "ETH_USDC_PERP": 50,
     "SOL_USDC_PERP": 50,
-    "ZEC_USDC_PERP": 10,
-    "2Z_USDT_PERP": 10,
-    "MON_USD_PERP": 10,
+    # ZEC removed - orderbook has 38% spread, no liquidity
+    # "ZEC_USDC_PERP": 10,
+    # "2Z_USDT_PERP": 10,
+    # "MON_USD_PERP": 10,
 }
 
 # Map Backpack symbols to Binance stream names
-# Note: Some symbols may not have Binance futures equivalents
 BINANCE_TICKERS: Dict[str, str] = {
     "BTC_USDC_PERP": "btcusdt",
     "ETH_USDC_PERP": "ethusdt",
     "SOL_USDC_PERP": "solusdt",
-    "ZEC_USDC_PERP": "zecusdt",
-    # 2Z and MON don't have Binance futures - will use spot or skip
 }
 
 # Reverse mapping: Binance ticker -> Backpack symbol
 BINANCE_TO_BACKPACK: Dict[str, str] = {v: k for k, v in BINANCE_TICKERS.items()}
 
 # Trading parameters
-WICK_THRESHOLD = 0.003  # 0.3% price move
-WICK_WINDOW_SECONDS = 1.0  # Time window for wick detection
+WICK_THRESHOLD = 0.001  # 0.1% price move (user's setting)
+WICK_WINDOW_SECONDS = 2.0  # Time window for wick detection
 LEVERAGE_USAGE = 0.30  # Use 30% of max leverage
 NUM_SYMBOLS = len(LEVERAGE)  # Number of trading pairs
 
@@ -71,9 +70,10 @@ SL_PERCENT = 0.002  # 0.2% stop loss
 PROFIT_TIMEOUT_SECONDS = 30  # Close profitable position after 30s
 
 # Safety parameters
-COOLDOWN_SECONDS = 3  # Cooldown per symbol after trade
+COOLDOWN_SECONDS = 5  # Increased cooldown per symbol after trade attempt
 MAX_LOSS_PER_SYMBOL = -15.0  # Pause symbol if cumulative loss exceeds this
 STALE_ORDER_TIMEOUT = 10  # Cancel unfilled orders after 10 seconds
+MAX_PRICE_DEVIATION = 0.02  # 2% max deviation from Binance price
 
 # Binance WebSocket - use combined stream endpoint
 BINANCE_WS_URL = "wss://fstream.binance.com/stream"
@@ -347,47 +347,20 @@ class PointsFarmer:
         state.last_trade_time = time.time()
 
         try:
-            # Get reference price from Binance
+            # ALWAYS use Binance price as the reference (more reliable than orderbook)
             binance_price = self._last_prices.get(symbol)
             if not binance_price:
-                if self.debug:
-                    print(f"[{symbol}] No Binance price available")
+                print(f"[{symbol}] No Binance price available")
                 return
 
-            # Get orderbook for best price
-            depth = await self.public.get_depth(symbol)
-
-            if self.debug:
-                # Log full orderbook response to debug symbol mismatch
-                top_bids = depth.get("bids", [])[:3] if depth.get("bids") else []
-                top_asks = depth.get("asks", [])[:3] if depth.get("asks") else []
-                print(f"[{symbol}] Orderbook - Bids: {top_bids}, Asks: {top_asks}")
-                print(f"[{symbol}] Binance price: ${binance_price:.2f}")
-
+            # Calculate entry price based on Binance price
+            # Use small offset to ensure maker order (won't immediately match)
             if side == Side.LONG:
-                # Buy at best bid
-                if not depth.get("bids") or len(depth["bids"]) == 0:
-                    print(f"[{symbol}] No bids in orderbook")
-                    return
-                book_price = float(depth["bids"][0][0])
+                # Place bid slightly below current price
+                entry_price = binance_price * (1 - 0.0002)  # 0.02% below
             else:
-                # Sell at best ask
-                if not depth.get("asks") or len(depth["asks"]) == 0:
-                    print(f"[{symbol}] No asks in orderbook")
-                    return
-                book_price = float(depth["asks"][0][0])
-
-            # Validate: book price should be within 5% of Binance price
-            price_deviation = abs(book_price - binance_price) / binance_price
-            if price_deviation > 0.05:
-                print(f"[{symbol}] WARNING: Orderbook price ${book_price:.2f} differs from Binance ${binance_price:.2f} by {price_deviation*100:.1f}%")
-                # Use Binance price with small offset instead
-                if side == Side.LONG:
-                    entry_price = binance_price * 0.9995  # Slightly below for maker
-                else:
-                    entry_price = binance_price * 1.0005  # Slightly above for maker
-            else:
-                entry_price = book_price
+                # Place ask slightly above current price
+                entry_price = binance_price * (1 + 0.0002)  # 0.02% above
 
             # Round price to appropriate precision
             entry_price = self._round_price(symbol, entry_price)
@@ -404,15 +377,14 @@ class PointsFarmer:
             quantity = self._round_quantity(symbol, quantity)
 
             if quantity <= 0:
-                if self.debug:
-                    print(f"[{symbol}] Quantity too small: {quantity}")
+                print(f"[{symbol}] Quantity too small")
                 return
 
             # Place maker-only limit order
             order_side = "Bid" if side == Side.LONG else "Ask"
+            side_str = "Long" if side == Side.LONG else "Short"
 
-            if self.debug:
-                print(f"[{symbol}] Placing {order_side} {quantity} @ {entry_price} (Binance: {binance_price:.2f})")
+            print(f"[{symbol}] Placing {side_str} {quantity} @ ${entry_price:.2f} (Binance: ${binance_price:.2f})")
 
             result = await self.account.execute_order(
                 symbol=symbol,
@@ -449,12 +421,11 @@ class PointsFarmer:
                     notional=notional,
                 )
 
-                side_str = "Long" if side == Side.LONG else "Short"
                 print(f"ENTRY {symbol} {side_str} {quantity:.6f} @ {entry_price:.2f}")
                 print(f"  [{symbol}] TP @ {tp_price:.2f}, SL @ {sl_price:.2f}")
             else:
-                if self.debug:
-                    print(f"[{symbol}] Order failed: {result}")
+                error_msg = result.get('message', result) if isinstance(result, dict) else result
+                print(f"[{symbol}] Order failed: {error_msg}")
 
         except Exception as e:
             print(f"Entry error {symbol}: {e}")
@@ -740,14 +711,15 @@ class PointsFarmer:
         return 0.0
 
     def _round_quantity(self, symbol: str, quantity: float) -> float:
-        """Round quantity based on symbol precision."""
-        # BTC needs more decimals, others less
+        """Round quantity based on symbol precision (from Backpack specs)."""
         if "BTC" in symbol:
-            return round(quantity, 5)
+            return round(quantity, 4)  # 0.0001 BTC min
         elif "ETH" in symbol:
-            return round(quantity, 4)
+            return round(quantity, 3)  # 0.001 ETH min
+        elif "SOL" in symbol:
+            return round(quantity, 2)  # 0.01 SOL min
         else:
-            return round(quantity, 3)
+            return round(quantity, 2)  # Conservative default
 
     def _round_price(self, symbol: str, price: float) -> float:
         """Round price based on symbol tick size."""
