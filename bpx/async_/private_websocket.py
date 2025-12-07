@@ -1,7 +1,14 @@
 import asyncio
 import json
 from typing import Optional, Callable, Awaitable, List, Dict, Any, Union
-from websockets.asyncio.client import connect, ClientConnection
+
+# Handle websockets version compatibility (v13+ vs older)
+try:
+    from websockets.asyncio.client import connect, ClientConnection
+except ImportError:
+    from websockets import connect
+    from websockets.client import WebSocketClientProtocol as ClientConnection
+
 from websockets.exceptions import ConnectionClosed
 
 from bpx.base.base_private_websocket import BasePrivateWebsocket
@@ -60,7 +67,12 @@ class PrivateWebsocket(BasePrivateWebsocket):
     @property
     def is_connected(self) -> bool:
         """Check if websocket is currently connected."""
-        return self._connection is not None and self._connection.state.name == "OPEN"
+        if self._connection is None:
+            return False
+        # Handle both websockets v13+ (state.name) and older versions (open property)
+        if hasattr(self._connection, "state"):
+            return self._connection.state.name == "OPEN"
+        return getattr(self._connection, "open", False)
 
     async def connect(self) -> None:
         """
