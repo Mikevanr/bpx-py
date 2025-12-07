@@ -340,14 +340,10 @@ class PointsFarmer:
 
     async def _connect_private_websocket(self) -> None:
         """Connect to Backpack private websocket for real-time order/position updates."""
-        import base64
-        # Get the base64 encoded secret key
-        private_bytes = self.account.private_key.private_bytes_raw()
-        secret_key_b64 = base64.b64encode(private_bytes).decode()
-
+        # Use the secret_key that was passed to the constructor (already base64 encoded)
         self._private_ws = PrivateWebsocket(
             public_key=self.public_key,
-            secret_key=secret_key_b64,
+            secret_key=self.secret_key,
             debug=self.debug,
         )
         await self._private_ws.connect()
