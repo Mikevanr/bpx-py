@@ -68,11 +68,11 @@ LEVERAGE_USAGE = 0.30  # Use 30% of max leverage
 NUM_SYMBOLS = len(LEVERAGE)  # Number of trading pairs
 
 # Exit parameters
-TP_PERCENT = 0.001  # 0.1% take profit
-SL_PERCENT = 0.002  # 0.2% stop loss
+TP_PERCENT = 0.0025  # 0.25% take profit (~$1.14 on $455 position, covers ~$0.48 fees)
+SL_PERCENT = 0.004  # 0.4% stop loss (2:1 risk ratio with TP)
 MAX_LOSS_USDC = 1.50  # Close position if unrealized loss exceeds $1.50
 PROFIT_TIMEOUT_SECONDS = 30  # Close profitable position after 30s
-MIN_PROFIT_FOR_TIMEOUT = 0.0005  # 0.05% minimum profit to trigger timeout (avoid false positives)
+MIN_PROFIT_FOR_TIMEOUT = 0.001  # 0.1% minimum profit to trigger timeout
 
 # Safety parameters
 COOLDOWN_SECONDS = 2  # Cooldown per symbol after trade attempt (reduced for more activity)
