@@ -70,6 +70,7 @@ NUM_SYMBOLS = len(LEVERAGE)  # Number of trading pairs
 # Exit parameters
 TP_PERCENT = 0.001  # 0.1% take profit
 SL_PERCENT = 0.002  # 0.2% stop loss
+MAX_LOSS_USDC = 1.50  # Close position if unrealized loss exceeds $1.50
 PROFIT_TIMEOUT_SECONDS = 30  # Close profitable position after 30s
 MIN_PROFIT_FOR_TIMEOUT = 0.0005  # 0.05% minimum profit to trigger timeout (avoid false positives)
 
@@ -859,7 +860,19 @@ class PointsFarmer:
                     if state.pending_entry_order_id:
                         continue
 
-                    # Check SL using Backpack price
+                    # Calculate unrealized P/L in USDC
+                    if position.side == Side.LONG:
+                        unrealized_pnl = (current_price - position.entry_price) * position.quantity
+                    else:
+                        unrealized_pnl = (position.entry_price - current_price) * position.quantity
+
+                    # Check MAX_LOSS_USDC first (dollar-based stop loss)
+                    if unrealized_pnl <= -MAX_LOSS_USDC:
+                        print(f"[{symbol}] MAX LOSS HIT: ${unrealized_pnl:.2f} <= -${MAX_LOSS_USDC}")
+                        await self._close_position_market(symbol, position, "MAX_LOSS")
+                        continue
+
+                    # Check price-based SL
                     if position.side == Side.LONG:
                         if current_price <= position.sl_price:
                             print(f"[{symbol}] SL HIT: price {current_price:.2f} <= SL {position.sl_price:.2f}")
