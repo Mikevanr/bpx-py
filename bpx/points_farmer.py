@@ -62,17 +62,17 @@ BINANCE_TICKERS: Dict[str, str] = {
 BINANCE_TO_BACKPACK: Dict[str, str] = {v: k for k, v in BINANCE_TICKERS.items()}
 
 # Trading parameters
-WICK_THRESHOLD = 0.0005  # 0.05% price move - lower for more frequent signals
-WICK_WINDOW_SECONDS = 2.0  # Time window for wick detection
-LEVERAGE_USAGE = 0.30  # Use 30% of max leverage
+WICK_THRESHOLD = 0.002  # 0.2% price move - only trade significant moves
+WICK_WINDOW_SECONDS = 3.0  # Time window for wick detection
+LEVERAGE_USAGE = 0.25  # Use 25% of max leverage (slightly reduced for safety)
 NUM_SYMBOLS = len(LEVERAGE)  # Number of trading pairs
 
 # Exit parameters
-TP_PERCENT = 0.0025  # 0.25% take profit (~$1.14 on $455 position, covers ~$0.48 fees)
-SL_PERCENT = 0.004  # 0.4% stop loss (2:1 risk ratio with TP)
-MAX_LOSS_USDC = 1.50  # Close position if unrealized loss exceeds $1.50
-PROFIT_TIMEOUT_SECONDS = 30  # Close profitable position after 30s
-MIN_PROFIT_FOR_TIMEOUT = 0.001  # 0.1% minimum profit to trigger timeout
+TP_PERCENT = 0.004  # 0.4% take profit (~$1.80 on $450, well above $0.48 fees)
+SL_PERCENT = 0.003  # 0.3% stop loss (tighter stop, cut losses fast)
+MAX_LOSS_USDC = 0.80  # Close position if unrealized loss exceeds $0.80
+PROFIT_TIMEOUT_SECONDS = 45  # Close profitable position after 45s
+MIN_PROFIT_FOR_TIMEOUT = 0.002  # 0.2% minimum profit to trigger timeout
 
 # Safety parameters
 COOLDOWN_SECONDS = 2  # Cooldown per symbol after trade attempt (reduced for more activity)
@@ -507,17 +507,18 @@ class PointsFarmer:
         newest_price = window_prices[-1].price
         price_change = (newest_price - oldest_price) / oldest_price
 
-        # Detect wick direction
+        # Detect breakout/momentum direction
         if abs(price_change) >= WICK_THRESHOLD:
             self.stats.wicks_detected += 1
-            direction = "DROP" if price_change < 0 else "SPIKE"
-            print(f"[{symbol}] WICK {direction}: {price_change*100:.2f}%")
+            direction = "BREAKOUT_DOWN" if price_change < 0 else "BREAKOUT_UP"
+            print(f"[{symbol}] {direction}: {price_change*100:.2f}%")
 
-            if price_change < 0:
-                # Price dropped -> go Long (buy the dip)
+            # MOMENTUM STRATEGY: Follow the trend, don't fade it
+            if price_change > 0:
+                # Price breaking up -> go Long (ride the momentum)
                 await self._enter_position(symbol, Side.LONG)
             else:
-                # Price spiked -> go Short (fade the pump)
+                # Price breaking down -> go Short (ride the momentum)
                 await self._enter_position(symbol, Side.SHORT)
 
     # =========================================================================
