@@ -867,6 +867,12 @@ class PointsFarmer:
                     else:
                         unrealized_pnl = (position.entry_price - current_price) * position.quantity
 
+                    # Log position status every few seconds for debugging
+                    time_held = time.time() - position.entry_time
+                    if int(time_held) % 5 == 0 and int(time_held) > 0:  # Every 5 seconds
+                        side_str = "LONG" if position.side == Side.LONG else "SHORT"
+                        print(f"[{symbol}] {side_str} | Entry={position.entry_price:.2f} Now={current_price:.2f} | uPnL=${unrealized_pnl:.2f} | SL={position.sl_price:.2f} | {time_held:.0f}s")
+
                     # Check MAX_LOSS_USDC first (dollar-based stop loss)
                     if unrealized_pnl <= -MAX_LOSS_USDC:
                         print(f"[{symbol}] MAX LOSS HIT: ${unrealized_pnl:.2f} <= -${MAX_LOSS_USDC}")
@@ -898,8 +904,8 @@ class PointsFarmer:
                             )
 
             except Exception as e:
-                if self.debug:
-                    print(f"Monitor error: {e}")
+                # Always log monitor errors - this is critical for SL execution
+                print(f"Monitor error: {e}")
 
             await asyncio.sleep(0.1)
 
