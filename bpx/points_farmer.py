@@ -108,6 +108,7 @@ class Position:
     entry_time: float
     order_id: Optional[str] = None
     tp_order_id: Optional[str] = None
+    sl_order_id: Optional[str] = None
     tp_price: Optional[float] = None
     sl_price: Optional[float] = None
     notional: float = 0.0
@@ -392,12 +393,17 @@ class PointsFarmer:
                     if state.position:
                         state.position.entry_time = time.time()
                         state.position.entry_price = float(price) if price else state.position.entry_price
-                        # Place TP order
+                        # Place TP and SL orders
                         await self._place_tp_order(symbol, state.position)
+                        await self._place_sl_order(symbol, state.position)
 
                 elif state and state.position and state.position.tp_order_id == order_id:
                     # TP order filled
                     await self._handle_tp_fill(symbol, state, float(price) if price else None)
+
+                elif state and state.position and state.position.sl_order_id == order_id:
+                    # SL order filled
+                    await self._handle_sl_fill(symbol, state, float(price) if price else None)
 
             elif status == "Cancelled":
                 state = self.states.get(symbol)
@@ -412,6 +418,10 @@ class PointsFarmer:
                         state.position.tp_order_id = None
                         if self.debug:
                             print(f"[{symbol}] TP order cancelled")
+                    elif state.position and state.position.sl_order_id == order_id:
+                        state.position.sl_order_id = None
+                        if self.debug:
+                            print(f"[{symbol}] SL order cancelled")
 
         except Exception as e:
             if self.debug:
@@ -473,6 +483,55 @@ class PointsFarmer:
             f"P/L={pnl_sign}{pnl_usdc:.2f} USDC | "
             f"Volume={volume:,.0f}"
         )
+
+        # Cancel SL order since position is closed
+        if position.sl_order_id:
+            try:
+                await self.account.cancel_order(symbol=symbol, order_id=position.sl_order_id)
+            except Exception:
+                pass
+
+        # Clear position
+        state.position = None
+        state.pending_entry_order_id = None
+
+    async def _handle_sl_fill(self, symbol: str, state: SymbolState, fill_price: Optional[float]) -> None:
+        """Handle stop-loss fill."""
+        if not state.position:
+            return
+
+        position = state.position
+        close_price = fill_price or self._last_prices.get(symbol, position.entry_price)
+
+        # Calculate P/L using actual prices and quantity
+        if position.side == Side.LONG:
+            pnl_usdc = (close_price - position.entry_price) * position.quantity
+        else:
+            pnl_usdc = (position.entry_price - close_price) * position.quantity
+
+        volume = position.notional * 2  # Entry + exit
+
+        # Update stats
+        state.cumulative_pnl += pnl_usdc
+        self.stats.total_pnl += pnl_usdc
+        self.stats.total_volume += volume
+        self.stats.total_points += volume
+        self.stats.total_trades += 1
+
+        pnl_sign = "+" if pnl_usdc >= 0 else ""
+        print(
+            f"CLOSE {symbol} (SL_FILL) | "
+            f"Entry={position.entry_price:.2f} Close={close_price:.2f} | "
+            f"P/L={pnl_sign}{pnl_usdc:.2f} USDC | "
+            f"Volume={volume:,.0f}"
+        )
+
+        # Cancel TP order since position is closed
+        if position.tp_order_id:
+            try:
+                await self.account.cancel_order(symbol=symbol, order_id=position.tp_order_id)
+            except Exception:
+                pass
 
         # Clear position
         state.position = None
@@ -676,8 +735,9 @@ class PointsFarmer:
                     print(f"*** ENTRY FILLED {symbol} {side_str} {state.position.quantity:.6f} @ {fill_price:.2f} ***")
                     print(f"    TP @ {tp_price:.2f}, SL @ {sl_price:.2f}")
 
-                    # Place TP order immediately
+                    # Place TP and SL orders immediately
                     await self._place_tp_order(symbol, state.position)
+                    await self._place_sl_order(symbol, state.position)
 
                     # Update stats for the entry
                     self.stats.total_volume += notional
@@ -753,6 +813,35 @@ class PointsFarmer:
         except Exception as e:
             print(f"TP order error {symbol}: {e}")
 
+    async def _place_sl_order(self, symbol: str, position: Position) -> None:
+        """Place stop-loss order on exchange for guaranteed execution."""
+        try:
+            # Opposite side for closing
+            close_side = "Ask" if position.side == Side.LONG else "Bid"
+
+            # Round SL price properly
+            sl_price = self._round_price(symbol, position.sl_price)
+
+            # Use trigger price for stop order
+            result = await self.account.execute_order(
+                symbol=symbol,
+                side=close_side,
+                order_type="Market",
+                quantity=str(position.quantity),
+                trigger_price=str(sl_price),
+                reduce_only=True,
+            )
+
+            if isinstance(result, dict) and result.get("id"):
+                position.sl_order_id = result["id"]
+                print(f"[{symbol}] SL order placed: trigger @ {sl_price}")
+            else:
+                error_msg = result.get('message', result) if isinstance(result, dict) else result
+                print(f"[{symbol}] SL order failed: {error_msg} - using software SL as backup")
+
+        except Exception as e:
+            print(f"SL order error {symbol}: {e} - using software SL as backup")
+
     async def _close_position_market(
         self, symbol: str, position: Position, reason: str
     ) -> None:
@@ -765,6 +854,15 @@ class PointsFarmer:
                 try:
                     await self.account.cancel_order(
                         symbol=symbol, order_id=position.tp_order_id
+                    )
+                except Exception:
+                    pass
+
+            # Cancel SL order if exists
+            if position.sl_order_id:
+                try:
+                    await self.account.cancel_order(
+                        symbol=symbol, order_id=position.sl_order_id
                     )
                 except Exception:
                     pass
@@ -955,8 +1053,9 @@ class PointsFarmer:
                             state.position.entry_price = actual_entry
                             state.position.quantity = abs(actual_size)
                             state.position.entry_time = time.time()
-                            # Place TP order
+                            # Place TP and SL orders
                             await self._place_tp_order(symbol, state.position)
+                            await self._place_sl_order(symbol, state.position)
                     else:
                         # No pending entry - check if position is still open
                         if abs(actual_size) < 0.00001:
@@ -1090,8 +1189,9 @@ class PointsFarmer:
             print(f"*** ADOPTED POSITION: {symbol} {side_str} {quantity:.6f} @ {entry_price:.2f} ***")
             print(f"    TP @ {tp_price:.2f}, SL @ {sl_price:.2f}, Notional: ${notional_value:.2f}")
 
-            # Place TP order for the adopted position
+            # Place TP and SL orders for the adopted position
             await self._place_tp_order(symbol, state.position)
+            await self._place_sl_order(symbol, state.position)
 
         except Exception as e:
             print(f"Error adopting position {symbol}: {e}")
