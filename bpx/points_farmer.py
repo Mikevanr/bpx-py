@@ -685,20 +685,18 @@ class PointsFarmer:
                 print(f"[{symbol}] Quantity too small")
                 return
 
-            # Place maker-only limit order
+            # Use Market order for guaranteed fills (spreads are tight ~0.001%)
             order_side = "Bid" if side == Side.LONG else "Ask"
             side_str = "Long" if side == Side.LONG else "Short"
 
-            print(f"[{symbol}] Placing {side_str} {quantity} @ ${entry_price:.2f} (bid={best_bid:.2f}, ask={best_ask:.2f})")
+            print(f"[{symbol}] Placing MARKET {side_str} {quantity} (bid={best_bid:.2f}, ask={best_ask:.2f})")
 
-            # Use IOC (Immediate or Cancel) for aggressive fills - order fills immediately or cancels
+            # Use Market order for guaranteed execution
             result = await self.account.execute_order(
                 symbol=symbol,
                 side=order_side,
-                order_type="Limit",
+                order_type="Market",
                 quantity=str(quantity),
-                price=str(entry_price),
-                time_in_force="IOC",  # Immediate or Cancel for fast execution
             )
 
             if isinstance(result, dict) and result.get("id"):
@@ -706,10 +704,11 @@ class PointsFarmer:
                 order_status = result.get("status", "")
                 executed_qty = float(result.get("executedQuantity", 0) or 0)
 
-                # IOC orders fill immediately or cancel - check status
+                # Market orders should fill immediately
                 if order_status == "Filled" or executed_qty > 0:
-                    # Order filled! Get actual fill price if available
-                    fill_price = float(result.get("price", entry_price) or entry_price)
+                    # Get actual fill price (try multiple fields)
+                    fill_price = result.get("avgPrice") or result.get("price") or entry_price
+                    fill_price = float(fill_price) if fill_price else entry_price
 
                     # Calculate TP and SL prices
                     if side == Side.LONG:
