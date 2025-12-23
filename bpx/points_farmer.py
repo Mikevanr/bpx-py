@@ -942,7 +942,7 @@ class PointsFarmer:
 
     async def _position_monitor_loop(self) -> None:
         """Monitor positions for SL hits and profit timeouts."""
-        print("[MONITOR] Position monitor loop started")
+        print("[MONITOR] Position monitor loop started", flush=True)
         last_position_check = 0
         last_status_log = 0
 
@@ -952,7 +952,9 @@ class PointsFarmer:
                 now = time.time()
                 if now - last_position_check >= 2:  # Check every 2 seconds
                     last_position_check = now
+                    print("[MONITOR] Calling _sync_positions...", flush=True)
                     await self._sync_positions()
+                    print("[MONITOR] _sync_positions returned", flush=True)
 
                 for symbol, state in self.states.items():
                     if not state.position:
@@ -1026,17 +1028,16 @@ class PointsFarmer:
     async def _sync_positions(self) -> None:
         """Sync local state with actual positions on Backpack."""
         try:
+            print("[SYNC] Fetching positions from API...", flush=True)
             positions = await self.account.get_open_positions()
-
-            if self.debug:
-                print(f"[SYNC] Called - raw response type: {type(positions)}")
+            print(f"[SYNC] Got response: type={type(positions)}", flush=True)
 
             if not isinstance(positions, list):
-                print(f"[SYNC] ERROR: Positions not a list: {type(positions)} - {positions}")
+                print(f"[SYNC] ERROR: Positions not a list: {type(positions)} - {positions}", flush=True)
                 return
 
             # Always log position count (even if empty)
-            print(f"[SYNC] API returned {len(positions)} position(s)")
+            print(f"[SYNC] API returned {len(positions)} position(s)", flush=True)
 
             # Debug: show all positions from API
             if positions:
@@ -1121,9 +1122,11 @@ class PointsFarmer:
                     await self._adopt_position(symbol, actual)
 
         except Exception as e:
-            print(f"Sync positions error: {e}")
+            print(f"Sync positions error: {e}", flush=True)
             import traceback
             traceback.print_exc()
+            import sys
+            sys.stdout.flush()
 
     async def _detect_existing_positions(self) -> None:
         """Detect and adopt any existing positions on startup."""
