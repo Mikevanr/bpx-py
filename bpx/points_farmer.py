@@ -942,6 +942,7 @@ class PointsFarmer:
 
     async def _position_monitor_loop(self) -> None:
         """Monitor positions for SL hits and profit timeouts."""
+        print("[MONITOR] Position monitor loop started")
         last_position_check = 0
         last_status_log = 0
 
@@ -1027,13 +1028,18 @@ class PointsFarmer:
         try:
             positions = await self.account.get_open_positions()
 
+            if self.debug:
+                print(f"[SYNC] Called - raw response type: {type(positions)}")
+
             if not isinstance(positions, list):
                 print(f"[SYNC] ERROR: Positions not a list: {type(positions)} - {positions}")
                 return
 
+            # Always log position count (even if empty)
+            print(f"[SYNC] API returned {len(positions)} position(s)")
+
             # Debug: show all positions from API
             if positions:
-                print(f"[SYNC] API returned {len(positions)} position(s)")
                 for pos in positions:
                     sym = pos.get("symbol", "?")
                     qty = pos.get("netQuantity", 0)
@@ -1116,6 +1122,8 @@ class PointsFarmer:
 
         except Exception as e:
             print(f"Sync positions error: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def _detect_existing_positions(self) -> None:
         """Detect and adopt any existing positions on startup."""
