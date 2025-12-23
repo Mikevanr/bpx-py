@@ -685,18 +685,30 @@ class PointsFarmer:
                 print(f"[{symbol}] Quantity too small")
                 return
 
-            # Use Market order for guaranteed fills (spreads are tight ~0.001%)
+            # Use Limit GTC orders with aggressive pricing for maker fees
             order_side = "Bid" if side == Side.LONG else "Ask"
             side_str = "Long" if side == Side.LONG else "Short"
 
-            print(f"[{symbol}] Placing MARKET {side_str} {quantity} (bid={best_bid:.2f}, ask={best_ask:.2f})")
+            # Price at the spread to get filled quickly
+            if side == Side.LONG:
+                # Place bid at best ask to cross spread and fill
+                entry_price = best_ask
+            else:
+                # Place ask at best bid to cross spread and fill
+                entry_price = best_bid
 
-            # Use Market order for guaranteed execution
+            entry_price = self._round_price(symbol, entry_price)
+
+            print(f"[{symbol}] Placing {side_str} {quantity} @ ${entry_price:.2f} (bid={best_bid:.2f}, ask={best_ask:.2f})")
+
+            # Use Limit GTC order
             result = await self.account.execute_order(
                 symbol=symbol,
                 side=order_side,
-                order_type="Market",
+                order_type="Limit",
                 quantity=str(quantity),
+                price=str(entry_price),
+                time_in_force="GTC",
             )
 
             if isinstance(result, dict) and result.get("id"):
@@ -704,7 +716,7 @@ class PointsFarmer:
                 order_status = result.get("status", "")
                 executed_qty = float(result.get("executedQuantity", 0) or 0)
 
-                # Market orders should fill immediately
+                # Check if order filled immediately
                 if order_status == "Filled" or executed_qty > 0:
                     # Get actual fill price (try multiple fields)
                     fill_price = result.get("avgPrice") or result.get("price") or entry_price
@@ -743,7 +755,7 @@ class PointsFarmer:
                     self.stats.total_points += notional
 
                 elif order_status == "Cancelled" or order_status == "Expired":
-                    print(f"[{symbol}] IOC order not filled (status: {order_status})")
+                    print(f"[{symbol}] Order not filled (status: {order_status})")
                 else:
                     # Order might be pending - set up tracking just in case
                     state.pending_entry_order_id = order_id
