@@ -834,6 +834,7 @@ class PointsFarmer:
     async def _position_monitor_loop(self) -> None:
         """Monitor positions for SL hits and profit timeouts."""
         last_position_check = 0
+        last_status_log = 0
 
         while self._running:
             try:
@@ -855,10 +856,12 @@ class PointsFarmer:
                         # Fall back to Binance price
                         current_price = self._last_prices.get(symbol)
                     if not current_price:
+                        print(f"[{symbol}] WARNING: No price data for SL check!")
                         continue
 
                     # Skip SL/TP checks if entry order is still pending
                     if state.pending_entry_order_id:
+                        print(f"[{symbol}] WARNING: Skipping SL check - pending entry order")
                         continue
 
                     # Calculate unrealized P/L in USDC
@@ -867,11 +870,12 @@ class PointsFarmer:
                     else:
                         unrealized_pnl = (position.entry_price - current_price) * position.quantity
 
-                    # Log position status every few seconds for debugging
-                    time_held = time.time() - position.entry_time
-                    if int(time_held) % 5 == 0 and int(time_held) > 0:  # Every 5 seconds
+                    # Log position status every 5 seconds
+                    if now - last_status_log >= 5:
+                        last_status_log = now
                         side_str = "LONG" if position.side == Side.LONG else "SHORT"
-                        print(f"[{symbol}] {side_str} | Entry={position.entry_price:.2f} Now={current_price:.2f} | uPnL=${unrealized_pnl:.2f} | SL={position.sl_price:.2f} | {time_held:.0f}s")
+                        time_held = now - position.entry_time
+                        print(f"[{symbol}] MONITOR: {side_str} | Entry={position.entry_price:.2f} Now={current_price:.2f} | uPnL=${unrealized_pnl:.2f} | SL={position.sl_price:.2f} MaxLoss=${-MAX_LOSS_USDC} | {time_held:.0f}s")
 
                     # Check MAX_LOSS_USDC first (dollar-based stop loss)
                     if unrealized_pnl <= -MAX_LOSS_USDC:
@@ -925,6 +929,12 @@ class PointsFarmer:
                 symbol = pos.get("symbol")
                 if symbol and symbol in LEVERAGE:
                     actual_positions[symbol] = pos
+                    net_qty = float(pos.get("netQuantity", 0))
+                    if abs(net_qty) > 0.00001:
+                        # Log every sync to verify positions are being detected
+                        state = self.states.get(symbol)
+                        tracked = "TRACKED" if (state and state.position) else "NOT TRACKED"
+                        print(f"[SYNC] {symbol}: qty={net_qty:.6f} - {tracked}")
 
             # Check each tracked symbol
             for symbol, state in self.states.items():
