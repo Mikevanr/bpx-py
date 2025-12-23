@@ -1028,9 +1028,17 @@ class PointsFarmer:
             positions = await self.account.get_open_positions()
 
             if not isinstance(positions, list):
-                if self.debug:
-                    print(f"[SYNC] Positions not a list: {type(positions)}")
+                print(f"[SYNC] ERROR: Positions not a list: {type(positions)} - {positions}")
                 return
+
+            # Debug: show all positions from API
+            if positions:
+                print(f"[SYNC] API returned {len(positions)} position(s)")
+                for pos in positions:
+                    sym = pos.get("symbol", "?")
+                    qty = pos.get("netQuantity", 0)
+                    in_leverage = "YES" if sym in LEVERAGE else "NO"
+                    print(f"[SYNC]   -> {sym}: qty={qty}, in_config={in_leverage}")
 
             # Build map of actual positions
             actual_positions: Dict[str, Dict] = {}
