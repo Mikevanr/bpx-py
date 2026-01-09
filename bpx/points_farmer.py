@@ -64,7 +64,7 @@ BINANCE_TO_BACKPACK: Dict[str, str] = {v: k for k, v in BINANCE_TICKERS.items()}
 # Trading parameters
 # Position sizing: Uses 1/3 of balance per symbol with full leverage
 # Example: $170 balance / 3 symbols = $56.67 margin * 50x leverage = $2,833 notional
-WICK_THRESHOLD = 0.002  # 0.2% price move - only trade significant moves
+WICK_THRESHOLD = 0.0005  # 0.05% price move - more sensitive to catch more trades
 WICK_WINDOW_SECONDS = 3.0  # Time window for wick detection
 LEVERAGE_USAGE = 1.0  # Use full leverage (position size = balance/NUM_SYMBOLS * leverage)
 NUM_SYMBOLS = len(LEVERAGE)  # Number of trading pairs (divides balance evenly)
