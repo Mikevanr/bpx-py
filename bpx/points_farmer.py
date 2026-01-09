@@ -64,7 +64,7 @@ BINANCE_TO_BACKPACK: Dict[str, str] = {v: k for k, v in BINANCE_TICKERS.items()}
 # Trading parameters
 # Position sizing: Uses 1/3 of balance per symbol with full leverage
 # Example: $170 balance / 3 symbols = $56.67 margin * 50x leverage = $2,833 notional
-WICK_THRESHOLD = 0.0005  # 0.05% price move - more sensitive to catch more trades
+WICK_THRESHOLD = 0.0001  # 0.01% price move - very sensitive for quiet markets
 WICK_WINDOW_SECONDS = 3.0  # Time window for wick detection
 LEVERAGE_USAGE = 1.0  # Use full leverage (position size = balance/NUM_SYMBOLS * leverage)
 NUM_SYMBOLS = len(LEVERAGE)  # Number of trading pairs (divides balance evenly)
@@ -551,7 +551,9 @@ class PointsFarmer:
 
     async def _check_wick(self, symbol: str, state: SymbolState) -> None:
         """Check if a wick signal has occurred."""
-        if state.paused or state.position:
+        if state.paused:
+            return
+        if state.position:
             return
 
         # Cooldown check
@@ -582,7 +584,7 @@ class PointsFarmer:
         if abs(price_change) >= WICK_THRESHOLD:
             self.stats.wicks_detected += 1
             direction = "BREAKOUT_DOWN" if price_change < 0 else "BREAKOUT_UP"
-            print(f"[{symbol}] {direction}: {price_change*100:.2f}%")
+            print(f"[{symbol}] {direction}: {price_change*100:.3f}% - ATTEMPTING TRADE", flush=True)
 
             # MOMENTUM STRATEGY: Follow the trend, don't fade it
             if price_change > 0:
@@ -599,6 +601,8 @@ class PointsFarmer:
     async def _enter_position(self, symbol: str, side: Side) -> None:
         """Place a maker-only limit entry order for 50% fee discount."""
         state = self.states[symbol]
+        side_str = "Long" if side == Side.LONG else "Short"
+        print(f"[{symbol}] _enter_position called: {side_str}", flush=True)
 
         # Set cooldown immediately to prevent duplicate signals
         state.last_trade_time = time.time()
@@ -608,7 +612,7 @@ class PointsFarmer:
             binance_price = self._last_prices.get(symbol)
 
             if not binance_price:
-                print(f"[{symbol}] No Binance price available")
+                print(f"[{symbol}] BLOCKED: No Binance price available", flush=True)
                 return
 
             # Fetch orderbook to get actual bid/ask prices
