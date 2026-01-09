@@ -62,26 +62,30 @@ BINANCE_TICKERS: Dict[str, str] = {
 BINANCE_TO_BACKPACK: Dict[str, str] = {v: k for k, v in BINANCE_TICKERS.items()}
 
 # Trading parameters
+# Position sizing: Uses 1/3 of balance per symbol with full leverage
+# Example: $170 balance / 3 symbols = $56.67 margin * 50x leverage = $2,833 notional
 WICK_THRESHOLD = 0.002  # 0.2% price move - only trade significant moves
 WICK_WINDOW_SECONDS = 3.0  # Time window for wick detection
-LEVERAGE_USAGE = 0.25  # Use 25% of max leverage (slightly reduced for safety)
-NUM_SYMBOLS = len(LEVERAGE)  # Number of trading pairs
+LEVERAGE_USAGE = 1.0  # Use full leverage (position size = balance/NUM_SYMBOLS * leverage)
+NUM_SYMBOLS = len(LEVERAGE)  # Number of trading pairs (divides balance evenly)
 
-# Exit parameters
-TP_PERCENT = 0.004  # 0.4% take profit (~$1.80 on $450, well above $0.48 fees)
-SL_PERCENT = 0.003  # 0.3% stop loss (tighter stop, cut losses fast)
-MAX_LOSS_USDC = 0.80  # Close position if unrealized loss exceeds $0.80
+# Exit parameters - calculated on NOTIONAL (leveraged) amount, not margin
+# With $2,833 notional: 0.3% SL = $8.50 loss, 0.4% TP = $11.33 profit
+TP_PERCENT = 0.004  # 0.4% take profit on notional
+SL_PERCENT = 0.003  # 0.3% stop loss on notional
+MAX_LOSS_USDC = 10.00  # Close position if unrealized loss exceeds $10 (~0.35% on $2,833)
 PROFIT_TIMEOUT_SECONDS = 45  # Close profitable position after 45s
 MIN_PROFIT_FOR_TIMEOUT = 0.002  # 0.2% minimum profit to trigger timeout
 
 # Emergency parameters - override maker-only when things heat up
-EMERGENCY_LOSS_USDC = 1.50  # Emergency market close if loss exceeds this
-EMERGENCY_LOSS_VELOCITY = 0.50  # Emergency close if losing more than $0.50/second
+# These are higher thresholds for larger leveraged positions
+EMERGENCY_LOSS_USDC = 20.00  # Emergency market close if loss exceeds $20 (~0.7% on $2,833)
+EMERGENCY_LOSS_VELOCITY = 3.00  # Emergency close if losing more than $3/second
 EMERGENCY_LOSS_PERCENT = 0.008  # Emergency close if position down more than 0.8%
 
 # Safety parameters
 COOLDOWN_SECONDS = 2  # Cooldown per symbol after trade attempt (reduced for more activity)
-MAX_LOSS_PER_SYMBOL = -15.0  # Pause symbol if cumulative loss exceeds this
+MAX_LOSS_PER_SYMBOL = -50.0  # Pause symbol if cumulative loss exceeds $50
 STALE_ORDER_TIMEOUT = 5  # Cancel unfilled orders after 5 seconds (faster cycling)
 MAX_PRICE_DEVIATION = 0.02  # 2% max deviation from Binance price
 
