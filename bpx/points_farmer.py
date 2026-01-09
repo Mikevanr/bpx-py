@@ -74,6 +74,11 @@ MAX_LOSS_USDC = 0.80  # Close position if unrealized loss exceeds $0.80
 PROFIT_TIMEOUT_SECONDS = 45  # Close profitable position after 45s
 MIN_PROFIT_FOR_TIMEOUT = 0.002  # 0.2% minimum profit to trigger timeout
 
+# Emergency parameters - override maker-only when things heat up
+EMERGENCY_LOSS_USDC = 1.50  # Emergency market close if loss exceeds this
+EMERGENCY_LOSS_VELOCITY = 0.50  # Emergency close if losing more than $0.50/second
+EMERGENCY_LOSS_PERCENT = 0.008  # Emergency close if position down more than 0.8%
+
 # Safety parameters
 COOLDOWN_SECONDS = 2  # Cooldown per symbol after trade attempt (reduced for more activity)
 MAX_LOSS_PER_SYMBOL = -15.0  # Pause symbol if cumulative loss exceeds this
@@ -112,6 +117,9 @@ class Position:
     tp_price: Optional[float] = None
     sl_price: Optional[float] = None
     notional: float = 0.0
+    # For emergency velocity tracking
+    last_pnl: float = 0.0
+    last_pnl_time: float = 0.0
 
 
 @dataclass
@@ -926,6 +934,107 @@ class PointsFarmer:
         except Exception as e:
             print(f"Close error {symbol}: {e}")
 
+    async def _emergency_close(
+        self, symbol: str, position: Position, reason: str
+    ) -> None:
+        """Emergency close position with market order - bypasses maker-only strategy."""
+        state = self.states[symbol]
+
+        print(f"[{symbol}] 🚨 EMERGENCY CLOSE initiated - {reason}")
+
+        try:
+            # Cancel ALL existing orders immediately
+            if position.tp_order_id:
+                try:
+                    await self.account.cancel_order(
+                        symbol=symbol, order_id=position.tp_order_id
+                    )
+                    print(f"[{symbol}] Cancelled TP order")
+                except Exception:
+                    pass
+
+            if position.sl_order_id:
+                try:
+                    await self.account.cancel_order(
+                        symbol=symbol, order_id=position.sl_order_id
+                    )
+                    print(f"[{symbol}] Cancelled SL order")
+                except Exception:
+                    pass
+
+            # EMERGENCY: Use market order for guaranteed execution
+            close_side = "Ask" if position.side == Side.LONG else "Bid"
+
+            print(f"[{symbol}] 🚨 Sending MARKET order to close {position.quantity}")
+
+            result = await self.account.execute_order(
+                symbol=symbol,
+                side=close_side,
+                order_type="Market",
+                quantity=str(position.quantity),
+                reduce_only=True,
+            )
+
+            # Get actual fill price from the order result
+            close_price = None
+            if isinstance(result, dict):
+                close_price = result.get("price") or result.get("avgPrice")
+                if close_price:
+                    close_price = float(close_price)
+
+            # Fall back to cached price if no fill price returned
+            if not close_price:
+                close_price = self._backpack_prices.get(symbol) or self._last_prices.get(symbol, position.entry_price)
+
+            # Calculate P/L using actual prices
+            if position.side == Side.LONG:
+                pnl_usdc = (close_price - position.entry_price) * position.quantity
+            else:
+                pnl_usdc = (position.entry_price - close_price) * position.quantity
+
+            volume = position.notional * 2  # Entry + exit
+
+            # Update stats
+            state.cumulative_pnl += pnl_usdc
+            self.stats.total_pnl += pnl_usdc
+            self.stats.total_volume += volume
+            self.stats.total_points += volume
+            self.stats.total_trades += 1
+
+            # Check if symbol should be paused
+            if state.cumulative_pnl < MAX_LOSS_PER_SYMBOL:
+                state.paused = True
+                print(f"[{symbol}] PAUSED - cumulative loss: ${state.cumulative_pnl:.2f}")
+
+            pnl_sign = "+" if pnl_usdc >= 0 else ""
+            print(
+                f"🚨 EMERGENCY CLOSE {symbol} ({reason}) | "
+                f"Entry={position.entry_price:.2f} Close={close_price:.2f} | "
+                f"P/L={pnl_sign}{pnl_usdc:.2f} USDC | "
+                f"Volume={volume:,.0f}"
+            )
+
+            # Clear position
+            state.position = None
+            state.pending_entry_order_id = None
+
+        except Exception as e:
+            print(f"🚨 EMERGENCY CLOSE FAILED {symbol}: {e}")
+            # Try one more time with a fresh market order
+            try:
+                close_side = "Ask" if position.side == Side.LONG else "Bid"
+                await self.account.execute_order(
+                    symbol=symbol,
+                    side=close_side,
+                    order_type="Market",
+                    quantity=str(position.quantity),
+                    reduce_only=True,
+                )
+                state.position = None
+                print(f"[{symbol}] Emergency close retry succeeded")
+            except Exception as e2:
+                print(f"[{symbol}] CRITICAL: Emergency close retry also failed: {e2}")
+
     # =========================================================================
     # Position Monitoring
     # =========================================================================
@@ -969,17 +1078,55 @@ class PointsFarmer:
                     # Calculate unrealized P/L in USDC
                     if position.side == Side.LONG:
                         unrealized_pnl = (current_price - position.entry_price) * position.quantity
+                        loss_pct = (position.entry_price - current_price) / position.entry_price
                     else:
                         unrealized_pnl = (position.entry_price - current_price) * position.quantity
+                        loss_pct = (current_price - position.entry_price) / position.entry_price
+
+                    # Calculate loss velocity (how fast we're losing money)
+                    loss_velocity = 0.0
+                    if position.last_pnl_time > 0:
+                        time_diff = now - position.last_pnl_time
+                        if time_diff > 0:
+                            pnl_diff = position.last_pnl - unrealized_pnl  # Positive if losing more
+                            loss_velocity = pnl_diff / time_diff  # $/second
+
+                    # Update PnL tracking for velocity calculation
+                    position.last_pnl = unrealized_pnl
+                    position.last_pnl_time = now
 
                     # Log position status every 5 seconds
                     if now - last_status_log >= 5:
                         last_status_log = now
                         side_str = "LONG" if position.side == Side.LONG else "SHORT"
                         time_held = now - position.entry_time
-                        print(f"[{symbol}] MONITOR: {side_str} | Entry={position.entry_price:.2f} Now={current_price:.2f} | uPnL=${unrealized_pnl:.2f} | SL={position.sl_price:.2f} MaxLoss=${-MAX_LOSS_USDC} | {time_held:.0f}s")
+                        velocity_str = f"vel=${loss_velocity:.2f}/s" if loss_velocity > 0.1 else ""
+                        print(f"[{symbol}] MONITOR: {side_str} | Entry={position.entry_price:.2f} Now={current_price:.2f} | uPnL=${unrealized_pnl:.2f} | SL={position.sl_price:.2f} MaxLoss=${-MAX_LOSS_USDC} | {time_held:.0f}s {velocity_str}")
 
-                    # Check MAX_LOSS_USDC first (dollar-based stop loss)
+                    # ========== EMERGENCY CHECKS (market orders) ==========
+                    # These override maker-only strategy when things heat up
+
+                    # Emergency check 1: Absolute loss threshold
+                    if unrealized_pnl <= -EMERGENCY_LOSS_USDC:
+                        print(f"[{symbol}] 🚨 EMERGENCY LOSS: ${unrealized_pnl:.2f} <= -${EMERGENCY_LOSS_USDC}")
+                        await self._emergency_close(symbol, position, "EMERGENCY_LOSS")
+                        continue
+
+                    # Emergency check 2: Loss velocity (losing money too fast)
+                    if loss_velocity >= EMERGENCY_LOSS_VELOCITY:
+                        print(f"[{symbol}] 🚨 EMERGENCY VELOCITY: losing ${loss_velocity:.2f}/second!")
+                        await self._emergency_close(symbol, position, "EMERGENCY_VELOCITY")
+                        continue
+
+                    # Emergency check 3: Percentage loss threshold
+                    if loss_pct >= EMERGENCY_LOSS_PERCENT:
+                        print(f"[{symbol}] 🚨 EMERGENCY PERCENT: down {loss_pct*100:.2f}% >= {EMERGENCY_LOSS_PERCENT*100:.2f}%")
+                        await self._emergency_close(symbol, position, "EMERGENCY_PERCENT")
+                        continue
+
+                    # ========== NORMAL CHECKS ==========
+
+                    # Check MAX_LOSS_USDC (dollar-based stop loss)
                     if unrealized_pnl <= -MAX_LOSS_USDC:
                         print(f"[{symbol}] MAX LOSS HIT: ${unrealized_pnl:.2f} <= -${MAX_LOSS_USDC}")
                         await self._close_position_market(symbol, position, "MAX_LOSS")
