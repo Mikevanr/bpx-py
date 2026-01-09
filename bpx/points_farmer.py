@@ -672,16 +672,24 @@ class PointsFarmer:
                 print(f"[{symbol}] Price deviation too high: {price_diff*100:.2f}%")
                 return
 
-            # MAKER-ONLY PRICING: Place orders on the book (not crossing spread)
-            # For LONG: Place bid AT the best bid (join the bid queue)
-            # For SHORT: Place ask AT the best ask (join the ask queue)
-            # This ensures maker fees (50% discount)
-            if side == Side.LONG:
-                # Place bid at best bid to be a maker
-                entry_price = best_bid
+            # Calculate spread percentage
+            spread_pct = (best_ask - best_bid) / best_bid * 100
+
+            # ADAPTIVE PRICING based on spread width:
+            # - Wide spread (>= 0.02%): Use maker pricing (at best bid/ask)
+            # - Tight spread (< 0.02%): Cross the spread for immediate fills
+            if spread_pct >= 0.02:
+                # Wide spread - be a maker, sit on the book
+                if side == Side.LONG:
+                    entry_price = best_bid  # Join bid queue
+                else:
+                    entry_price = best_ask  # Join ask queue
             else:
-                # Place ask at best ask to be a maker
-                entry_price = best_ask
+                # Tight spread - cross for immediate fill
+                if side == Side.LONG:
+                    entry_price = best_ask  # Pay the ask to buy immediately
+                else:
+                    entry_price = best_bid  # Hit the bid to sell immediately
 
             # Round price to appropriate precision
             entry_price = self._round_price(symbol, entry_price)
@@ -704,18 +712,26 @@ class PointsFarmer:
             order_side = "Bid" if side == Side.LONG else "Ask"
             side_str = "Long" if side == Side.LONG else "Short"
 
-            print(f"[{symbol}] Placing MAKER {side_str} {quantity} @ ${entry_price:.2f} (bid={best_bid:.2f}, ask={best_ask:.2f})")
+            # If spread is very tight (< 0.02%), allow crossing spread for reliable fills
+            # Otherwise use post_only for maker fees
+            use_post_only = spread_pct >= 0.02
 
-            # Use Limit GTC order with post_only=True to guarantee maker fees
-            result = await self.account.execute_order(
-                symbol=symbol,
-                side=order_side,
-                order_type="Limit",
-                quantity=str(quantity),
-                price=str(entry_price),
-                time_in_force="GTC",
-                post_only=True,  # Ensures maker-only execution (rejected if would cross spread)
-            )
+            order_type_str = "MAKER" if use_post_only else "TAKER"
+            print(f"[{symbol}] Placing {order_type_str} {side_str} {quantity} @ ${entry_price:.2f} (bid={best_bid:.2f}, ask={best_ask:.2f}, spread={spread_pct:.3f}%)")
+
+            # Use Limit GTC order - post_only only when spread is wide enough
+            order_params = {
+                "symbol": symbol,
+                "side": order_side,
+                "order_type": "Limit",
+                "quantity": str(quantity),
+                "price": str(entry_price),
+                "time_in_force": "GTC",
+            }
+            if use_post_only:
+                order_params["post_only"] = True
+
+            result = await self.account.execute_order(**order_params)
 
             if isinstance(result, dict) and result.get("id"):
                 order_id = result["id"]
