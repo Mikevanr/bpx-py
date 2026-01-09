@@ -585,7 +585,7 @@ class PointsFarmer:
     # =========================================================================
 
     async def _enter_position(self, symbol: str, side: Side) -> None:
-        """Place a limit entry order - aggressive pricing for better fill rates."""
+        """Place a maker-only limit entry order for 50% fee discount."""
         state = self.states[symbol]
 
         # Set cooldown immediately to prevent duplicate signals
@@ -656,16 +656,16 @@ class PointsFarmer:
                 print(f"[{symbol}] Price deviation too high: {price_diff*100:.2f}%")
                 return
 
-            # AGGRESSIVE PRICING: Place order to CROSS the spread for faster fills
-            # This will likely be a taker order, but guarantees execution
-            # For LONG: Place slightly ABOVE best ask (buy aggressively)
-            # For SHORT: Place slightly BELOW best bid (sell aggressively)
+            # MAKER-ONLY PRICING: Place orders on the book (not crossing spread)
+            # For LONG: Place bid AT the best bid (join the bid queue)
+            # For SHORT: Place ask AT the best ask (join the ask queue)
+            # This ensures maker fees (50% discount)
             if side == Side.LONG:
-                # Place bid at best ask level to get filled immediately
-                entry_price = best_ask
-            else:
-                # Place ask at best bid level to get filled immediately
+                # Place bid at best bid to be a maker
                 entry_price = best_bid
+            else:
+                # Place ask at best ask to be a maker
+                entry_price = best_ask
 
             # Round price to appropriate precision
             entry_price = self._round_price(symbol, entry_price)
@@ -685,23 +685,12 @@ class PointsFarmer:
                 print(f"[{symbol}] Quantity too small")
                 return
 
-            # Use Limit GTC orders with aggressive pricing for maker fees
             order_side = "Bid" if side == Side.LONG else "Ask"
             side_str = "Long" if side == Side.LONG else "Short"
 
-            # Price at the spread to get filled quickly
-            if side == Side.LONG:
-                # Place bid at best ask to cross spread and fill
-                entry_price = best_ask
-            else:
-                # Place ask at best bid to cross spread and fill
-                entry_price = best_bid
+            print(f"[{symbol}] Placing MAKER {side_str} {quantity} @ ${entry_price:.2f} (bid={best_bid:.2f}, ask={best_ask:.2f})")
 
-            entry_price = self._round_price(symbol, entry_price)
-
-            print(f"[{symbol}] Placing {side_str} {quantity} @ ${entry_price:.2f} (bid={best_bid:.2f}, ask={best_ask:.2f})")
-
-            # Use Limit GTC order
+            # Use Limit GTC order with post_only=True to guarantee maker fees
             result = await self.account.execute_order(
                 symbol=symbol,
                 side=order_side,
@@ -709,6 +698,7 @@ class PointsFarmer:
                 quantity=str(quantity),
                 price=str(entry_price),
                 time_in_force="GTC",
+                post_only=True,  # Ensures maker-only execution (rejected if would cross spread)
             )
 
             if isinstance(result, dict) and result.get("id"):
@@ -789,7 +779,7 @@ class PointsFarmer:
             print(f"Entry error {symbol}: {e}")
 
     async def _place_tp_order(self, symbol: str, position: Position) -> None:
-        """Place take-profit limit order."""
+        """Place take-profit maker-only limit order for 50% fee discount."""
         try:
             # Opposite side for closing
             close_side = "Ask" if position.side == Side.LONG else "Bid"
@@ -805,7 +795,7 @@ class PointsFarmer:
                 price=str(tp_price),
                 reduce_only=True,
                 time_in_force="GTC",
-                # NOTE: Removed post_only=True - if TP price is already matchable, let it fill!
+                post_only=True,  # Ensures maker-only execution for 50% fee discount
             )
 
             if isinstance(result, dict) and result.get("id"):
