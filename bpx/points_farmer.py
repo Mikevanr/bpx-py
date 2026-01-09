@@ -839,13 +839,14 @@ class PointsFarmer:
             # Round SL price properly
             sl_price = self._round_price(symbol, position.sl_price)
 
-            # Use trigger price for stop order
+            # Use trigger price AND trigger quantity for stop order (Backpack requires both)
             result = await self.account.execute_order(
                 symbol=symbol,
                 side=close_side,
                 order_type="Market",
                 quantity=str(position.quantity),
                 trigger_price=str(sl_price),
+                trigger_quantity=str(position.quantity),  # Required by Backpack API
                 reduce_only=True,
             )
 
