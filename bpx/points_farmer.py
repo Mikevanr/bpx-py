@@ -40,30 +40,46 @@ from bpx.async_.private_websocket import PrivateWebsocket
 # =============================================================================
 
 # Trading pairs and their leverage
-# NOTE: Only include pairs with good liquidity on Backpack
+# Lower volume tokens with 10x leverage offer more points per dollar
 LEVERAGE: Dict[str, int] = {
+    # High liquidity (50x)
     "BTC_USDC_PERP": 50,
     "ETH_USDC_PERP": 50,
     "SOL_USDC_PERP": 50,
-    # ZEC removed - orderbook has 38% spread, no liquidity
-    # "ZEC_USDC_PERP": 10,
-    # "2Z_USDT_PERP": 10,
-    # "MON_USD_PERP": 10,
+    # Medium liquidity (10x) - more points per trade
+    "JTO_USDC_PERP": 10,
+    "PENDLE_USDC_PERP": 10,
+    "CRV_USDC_PERP": 10,
+    "JUP_USDC_PERP": 10,
+    "PENGU_USDC_PERP": 10,
+    "LDO_USDC_PERP": 10,
+    "KAITO_USDC_PERP": 10,
+    "WLFI_USDC_PERP": 10,
 }
 
-# Map Backpack symbols to Binance stream names
+# Map Backpack symbols to Binance stream names (for wick detection)
+# Tokens without Binance feeds will use Backpack price changes
 BINANCE_TICKERS: Dict[str, str] = {
     "BTC_USDC_PERP": "btcusdt",
     "ETH_USDC_PERP": "ethusdt",
     "SOL_USDC_PERP": "solusdt",
+    "JTO_USDC_PERP": "jtousdt",
+    "PENDLE_USDC_PERP": "pendleusdt",
+    "CRV_USDC_PERP": "crvusdt",
+    "JUP_USDC_PERP": "jupusdt",
+    "PENGU_USDC_PERP": "penguusdt",
+    "LDO_USDC_PERP": "ldousdt",
+    # KAITO and WLFI not on Binance - will use Backpack prices
 }
 
 # Reverse mapping: Binance ticker -> Backpack symbol
 BINANCE_TO_BACKPACK: Dict[str, str] = {v: k for k, v in BINANCE_TICKERS.items()}
 
 # Trading parameters
-# Position sizing: Uses 1/3 of balance per symbol with full leverage
-# Example: $170 balance / 3 symbols = $56.67 margin * 50x leverage = $2,833 notional
+# Position sizing: Divides balance evenly across symbols with their max leverage
+# Example: $170 balance / 11 symbols = $15.45 margin per symbol
+# High leverage (50x): $15.45 * 50 = $773 notional
+# Low leverage (10x): $15.45 * 10 = $155 notional
 WICK_THRESHOLD = 0.0001  # 0.01% price move - very sensitive for quiet markets
 WICK_WINDOW_SECONDS = 3.0  # Time window for wick detection
 LEVERAGE_USAGE = 1.0  # Use full leverage (position size = balance/NUM_SYMBOLS * leverage)
@@ -334,23 +350,42 @@ class PointsFarmer:
     # =========================================================================
 
     async def _backpack_price_loop(self) -> None:
-        """Fetch Backpack prices periodically to compare with Binance."""
+        """Fetch Backpack prices periodically and detect wicks for non-Binance tokens."""
         while self._running:
             try:
                 tickers = await self.public.get_tickers()
+                timestamp = time.time()
+
                 if isinstance(tickers, list):
                     for ticker in tickers:
                         symbol = ticker.get("symbol")
                         if symbol in LEVERAGE:
                             last_price = ticker.get("lastPrice")
                             if last_price:
-                                self._backpack_prices[symbol] = float(last_price)
+                                price = float(last_price)
+                                self._backpack_prices[symbol] = price
+
+                                # For tokens without Binance feed, use Backpack for wick detection
+                                if symbol not in BINANCE_TICKERS:
+                                    state = self.states[symbol]
+                                    state.prices.append(PricePoint(timestamp, price))
+                                    self._last_prices[symbol] = price
+                                    await self._check_wick(symbol, state)
+
                 elif isinstance(tickers, dict):
                     for symbol, data in tickers.items():
                         if symbol in LEVERAGE:
                             last_price = data.get("lastPrice")
                             if last_price:
-                                self._backpack_prices[symbol] = float(last_price)
+                                price = float(last_price)
+                                self._backpack_prices[symbol] = price
+
+                                # For tokens without Binance feed, use Backpack for wick detection
+                                if symbol not in BINANCE_TICKERS:
+                                    state = self.states[symbol]
+                                    state.prices.append(PricePoint(timestamp, price))
+                                    self._last_prices[symbol] = price
+                                    await self._check_wick(symbol, state)
             except Exception as e:
                 if self.debug:
                     print(f"Backpack price fetch error: {e}")
