@@ -70,12 +70,12 @@ LEVERAGE_USAGE = 1.0  # Use full leverage (position size = balance/NUM_SYMBOLS *
 NUM_SYMBOLS = len(LEVERAGE)  # Number of trading pairs (divides balance evenly)
 
 # Exit parameters - calculated on NOTIONAL (leveraged) amount, not margin
-# With $2,833 notional: 0.3% SL = $8.50 loss, 0.4% TP = $11.33 profit
-TP_PERCENT = 0.004  # 0.4% take profit on notional
-SL_PERCENT = 0.003  # 0.3% stop loss on notional
-MAX_LOSS_USDC = 10.00  # Close position if unrealized loss exceeds $10 (~0.35% on $2,833)
-PROFIT_TIMEOUT_SECONDS = 45  # Close profitable position after 45s
-MIN_PROFIT_FOR_TIMEOUT = 0.002  # 0.2% minimum profit to trigger timeout
+# With $2,833 notional: 0.15% TP = $4.25 profit, 0.2% SL = $5.67 loss
+TP_PERCENT = 0.0015  # 0.15% take profit - more achievable target
+SL_PERCENT = 0.002  # 0.2% stop loss on notional
+MAX_LOSS_USDC = 6.00  # Close position if unrealized loss exceeds $6 (~0.2% on $2,833)
+PROFIT_TIMEOUT_SECONDS = 30  # Close profitable position after 30s
+MIN_PROFIT_FOR_TIMEOUT = 0.0005  # 0.05% minimum profit to trigger timeout (capture small wins)
 
 # Emergency parameters - override maker-only when things heat up
 # These are higher thresholds for larger leveraged positions
