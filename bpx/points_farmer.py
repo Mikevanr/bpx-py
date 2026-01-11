@@ -58,7 +58,6 @@ LEVERAGE: Dict[str, int] = {
 }
 
 # Map Backpack symbols to Binance stream names (for wick detection)
-# Tokens without Binance feeds will use Backpack price changes
 BINANCE_TICKERS: Dict[str, str] = {
     "BTC_USDC_PERP": "btcusdt",
     "ETH_USDC_PERP": "ethusdt",
@@ -69,7 +68,8 @@ BINANCE_TICKERS: Dict[str, str] = {
     "JUP_USDC_PERP": "jupusdt",
     "PENGU_USDC_PERP": "penguusdt",
     "LDO_USDC_PERP": "ldousdt",
-    # KAITO and WLFI not on Binance - will use Backpack prices
+    "KAITO_USDC_PERP": "kaitousdt",
+    "WLFI_USDC_PERP": "wlfiusdt",
 }
 
 # Reverse mapping: Binance ticker -> Backpack symbol
