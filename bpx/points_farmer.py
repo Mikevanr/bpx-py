@@ -80,18 +80,18 @@ BINANCE_TO_BACKPACK: Dict[str, str] = {v: k for k, v in BINANCE_TICKERS.items()}
 # Example: $170 balance / 11 symbols = $15.45 margin per symbol
 # High leverage (50x): $15.45 * 50 = $773 notional
 # Low leverage (10x): $15.45 * 10 = $155 notional
-WICK_THRESHOLD = 0.0001  # 0.01% price move - very sensitive for quiet markets
-WICK_WINDOW_SECONDS = 3.0  # Time window for wick detection
+WICK_THRESHOLD = 0.001  # 0.1% price move - only trade significant wicks
+WICK_WINDOW_SECONDS = 2.0  # Time window for wick detection (shorter = faster reaction)
 LEVERAGE_USAGE = 1.0  # Use full leverage (position size = balance/NUM_SYMBOLS * leverage)
 NUM_SYMBOLS = len(LEVERAGE)  # Number of trading pairs (divides balance evenly)
 
-# Exit parameters - calculated on NOTIONAL (leveraged) amount, not margin
-# With $2,833 notional: 0.15% TP = $4.25 profit, 0.2% SL = $5.67 loss
-TP_PERCENT = 0.0015  # 0.15% take profit - more achievable target
-SL_PERCENT = 0.002  # 0.2% stop loss on notional
-MAX_LOSS_USDC = 6.00  # Close position if unrealized loss exceeds $6 (~0.2% on $2,833)
-PROFIT_TIMEOUT_SECONDS = 30  # Close profitable position after 30s
-MIN_PROFIT_FOR_TIMEOUT = 0.0005  # 0.05% minimum profit to trigger timeout (capture small wins)
+# Exit parameters - MEAN REVERSION strategy
+# Quick TP (capture the bounce), wider SL (give room for volatility)
+TP_PERCENT = 0.0008  # 0.08% take profit - quick scalp on the reversion
+SL_PERCENT = 0.003  # 0.3% stop loss - wider to avoid getting stopped on noise
+MAX_LOSS_USDC = 8.00  # Close position if unrealized loss exceeds $8
+PROFIT_TIMEOUT_SECONDS = 20  # Close profitable position after 20s (faster exits)
+MIN_PROFIT_FOR_TIMEOUT = 0.0003  # 0.03% minimum profit to trigger timeout
 
 # Emergency parameters - override maker-only when things heat up
 # These are higher thresholds for larger leveraged positions
@@ -615,19 +615,19 @@ class PointsFarmer:
         newest_price = window_prices[-1].price
         price_change = (newest_price - oldest_price) / oldest_price
 
-        # Detect breakout/momentum direction
+        # Detect wick and fade it (mean reversion)
         if abs(price_change) >= WICK_THRESHOLD:
             self.stats.wicks_detected += 1
-            direction = "BREAKOUT_DOWN" if price_change < 0 else "BREAKOUT_UP"
-            print(f"[{symbol}] {direction}: {price_change*100:.3f}% - ATTEMPTING TRADE", flush=True)
+            direction = "WICK_DOWN" if price_change < 0 else "WICK_UP"
+            print(f"[{symbol}] {direction}: {price_change*100:.3f}% - FADING (mean reversion)", flush=True)
 
-            # MOMENTUM STRATEGY: Follow the trend, don't fade it
+            # MEAN REVERSION STRATEGY: Fade the wick, expect price to revert
             if price_change > 0:
-                # Price breaking up -> go Long (ride the momentum)
-                await self._enter_position(symbol, Side.LONG)
-            else:
-                # Price breaking down -> go Short (ride the momentum)
+                # Price spiked UP -> go SHORT (expect it to come back down)
                 await self._enter_position(symbol, Side.SHORT)
+            else:
+                # Price spiked DOWN -> go LONG (expect it to bounce back up)
+                await self._enter_position(symbol, Side.LONG)
 
     # =========================================================================
     # Trade Execution
