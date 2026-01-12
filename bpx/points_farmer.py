@@ -160,14 +160,13 @@ BINANCE_TICKERS: Dict[str, str] = {
 BINANCE_TO_BACKPACK: Dict[str, str] = {v: k for k, v in BINANCE_TICKERS.items()}
 
 # Trading parameters
-# Position sizing: Divides balance evenly across symbols with their max leverage
-# Example: $170 balance / 11 symbols = $15.45 margin per symbol
-# High leverage (50x): $15.45 * 50 = $773 notional
-# Low leverage (10x): $15.45 * 10 = $155 notional
+# Position sizing: Balance divided by MAX_CONCURRENT_POSITIONS (not total symbols)
+# Example: $170 balance / 10 max positions = $17 margin per position
+# With 10x leverage: $17 * 10 = $170 notional per trade
 WICK_THRESHOLD = 0.001  # 0.1% price move - only trade significant wicks
 WICK_WINDOW_SECONDS = 2.0  # Time window for wick detection (shorter = faster reaction)
-LEVERAGE_USAGE = 1.0  # Use full leverage (position size = balance/NUM_SYMBOLS * leverage)
-NUM_SYMBOLS = len(LEVERAGE)  # Number of trading pairs (divides balance evenly)
+LEVERAGE_USAGE = 1.0  # Use full leverage
+MAX_CONCURRENT_POSITIONS = 10  # Max positions open at once (determines margin per trade)
 
 # Exit parameters - MEAN REVERSION strategy
 # Quick TP (capture the bounce), wider SL (give room for volatility)
@@ -723,6 +722,12 @@ class PointsFarmer:
         side_str = "Long" if side == Side.LONG else "Short"
         print(f"[{symbol}] _enter_position called: {side_str}", flush=True)
 
+        # Check max concurrent positions limit
+        current_positions = sum(1 for s in self.states.values() if s.position is not None)
+        if current_positions >= MAX_CONCURRENT_POSITIONS:
+            print(f"[{symbol}] BLOCKED: Max {MAX_CONCURRENT_POSITIONS} positions reached ({current_positions} open)")
+            return
+
         # Set cooldown immediately to prevent duplicate signals
         state.last_trade_time = time.time()
 
@@ -818,7 +823,7 @@ class PointsFarmer:
             usdc_balance = self._get_usdc_balance(balances)
 
             leverage = LEVERAGE[symbol]
-            notional = usdc_balance * LEVERAGE_USAGE * leverage / NUM_SYMBOLS
+            notional = usdc_balance * LEVERAGE_USAGE * leverage / MAX_CONCURRENT_POSITIONS
             quantity = notional / entry_price
 
             # Round quantity appropriately
