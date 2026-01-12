@@ -1651,14 +1651,73 @@ class PointsFarmer:
 
     def _round_quantity(self, symbol: str, quantity: float) -> float:
         """Round quantity based on symbol precision (from Backpack specs)."""
-        if "BTC" in symbol:
-            return round(quantity, 4)  # 0.0001 BTC min
-        elif "ETH" in symbol:
-            return round(quantity, 3)  # 0.001 ETH min
-        elif "SOL" in symbol:
-            return round(quantity, 2)  # 0.01 SOL min
-        else:
-            return round(quantity, 2)  # Conservative default
+        # Quantity decimal places for each symbol (0 = integer only)
+        QTY_DECIMALS = {
+            # High precision (expensive assets)
+            "BTC_USDC_PERP": 4,    # 0.0001 BTC
+            "ETH_USDC_PERP": 3,    # 0.001 ETH
+            "PAXG_USDC_PERP": 3,   # 0.001 PAXG (gold)
+            "TAO_USDC_PERP": 3,    # 0.001 TAO
+            # Medium precision
+            "SOL_USDC_PERP": 2,    # 0.01 SOL
+            "BNB_USDC_PERP": 2,    # 0.01 BNB
+            "AAVE_USDC_PERP": 2,   # 0.01 AAVE
+            "LTC_USDC_PERP": 2,    # 0.01 LTC
+            "ZEC_USDC_PERP": 2,    # 0.01 ZEC
+            "AVAX_USDC_PERP": 1,   # 0.1 AVAX
+            "LINK_USDC_PERP": 1,   # 0.1 LINK
+            "UNI_USDC_PERP": 1,    # 0.1 UNI
+            "DOT_USDC_PERP": 1,    # 0.1 DOT
+            "APT_USDC_PERP": 1,    # 0.1 APT
+            "SUI_USDC_PERP": 1,    # 0.1 SUI
+            "NEAR_USDC_PERP": 1,   # 0.1 NEAR
+            "HYPE_USDC_PERP": 1,   # 0.1 HYPE
+            "ONDO_USDC_PERP": 1,   # 0.1 ONDO
+            "JUP_USDC_PERP": 1,    # 0.1 JUP
+            "PENDLE_USDC_PERP": 1, # 0.1 PENDLE
+            "ENA_USDC_PERP": 1,    # 0.1 ENA
+            "TON_USDC_PERP": 1,    # 0.1 TON
+            "SEI_USDC_PERP": 1,    # 0.1 SEI
+            "JTO_USDC_PERP": 1,    # 0.1 JTO
+            "MNT_USDC_PERP": 1,    # 0.1 MNT
+            "LDO_USDC_PERP": 1,    # 0.1 LDO
+            "ARB_USDC_PERP": 1,    # 0.1 ARB
+            "OP_USDC_PERP": 1,     # 0.1 OP
+            "ZRO_USDC_PERP": 1,    # 0.1 ZRO
+            "TIA_USDC_PERP": 1,    # 0.1 TIA
+            "PYTH_USDC_PERP": 1,   # 0.1 PYTH
+            "IP_USDC_PERP": 1,     # 0.1 IP
+            "KAITO_USDC_PERP": 1,  # 0.1 KAITO
+            "WLD_USDC_PERP": 1,    # 0.1 WLD
+            "TRUMP_USDC_PERP": 1,  # 0.1 TRUMP
+            "BERA_USDC_PERP": 1,   # 0.1 BERA
+            # Integer quantities (low-price tokens)
+            "XRP_USDC_PERP": 0,    # 1 XRP
+            "DOGE_USDC_PERP": 0,   # 1 DOGE
+            "XLM_USDC_PERP": 0,    # 1 XLM
+            "ADA_USDC_PERP": 0,    # 1 ADA
+            "HBAR_USDC_PERP": 0,   # 1 HBAR
+            "CRV_USDC_PERP": 0,    # 1 CRV
+            "PENGU_USDC_PERP": 0,  # 1 PENGU
+            "WIF_USDC_PERP": 0,    # 1 WIF
+            "W_USDC_PERP": 0,      # 1 W
+            "S_USDC_PERP": 0,      # 1 S
+            "VIRTUAL_USDC_PERP": 0, # 1 VIRTUAL
+            "AERO_USDC_PERP": 0,   # 1 AERO
+            "FARTCOIN_USDC_PERP": 0, # 1 FARTCOIN
+            "MON_USDC_PERP": 0,    # 1 MON
+            "ASTER_USDC_PERP": 0,  # 1 ASTER
+            "LINEA_USDC_PERP": 0,  # 1 LINEA
+            "ZORA_USDC_PERP": 0,   # 1 ZORA
+            "XPL_USDC_PERP": 0,    # 1 XPL
+            "FLOCK_USDC_PERP": 0,  # 1 FLOCK
+            "WLFI_USDC_PERP": 0,   # 1 WLFI
+            "kBONK_USDC_PERP": 0,  # 1 kBONK (already in thousands)
+            "kPEPE_USDC_PERP": 0,  # 1 kPEPE (already in thousands)
+        }
+
+        decimals = QTY_DECIMALS.get(symbol, 0)  # Default to integer for unknown symbols
+        return round(quantity, decimals)
 
     def _round_price(self, symbol: str, price: float) -> float:
         """Round price based on symbol tick size."""
