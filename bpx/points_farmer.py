@@ -39,21 +39,23 @@ from bpx.async_.private_websocket import PrivateWebsocket
 # Configuration
 # =============================================================================
 
-# Trading pairs and their leverage
-# Lower volume tokens with 10x leverage offer more points per dollar
+# Trading pairs and their MAX leverage
 LEVERAGE: Dict[str, int] = {
-    # High liquidity (50x)
-    "BTC_USDC_PERP": 50,
+    # High liquidity
+    "BTC_USDC_PERP": 60,
     "ETH_USDC_PERP": 50,
     "SOL_USDC_PERP": 50,
-    # All 10x leverage pairs - more points per trade
-    "BNB_USDC_PERP": 10,
-    "PAXG_USDC_PERP": 10,
+    # Medium liquidity (20x)
+    "BNB_USDC_PERP": 20,
+    "PAXG_USDC_PERP": 20,
+    # Medium liquidity (13x)
+    "HYPE_USDC_PERP": 13,
+    "ENA_USDC_PERP": 13,
+    # Standard liquidity (10x)
     "APT_USDC_PERP": 10,
     "ASTER_USDC_PERP": 10,
     "SUI_USDC_PERP": 10,
     "AAVE_USDC_PERP": 10,
-    "HYPE_USDC_PERP": 10,
     "LINK_USDC_PERP": 10,
     "XRP_USDC_PERP": 10,
     "DOGE_USDC_PERP": 10,
@@ -74,7 +76,6 @@ LEVERAGE: Dict[str, int] = {
     "JTO_USDC_PERP": 10,
     "SEI_USDC_PERP": 10,
     "PENDLE_USDC_PERP": 10,
-    "ENA_USDC_PERP": 10,
     "JUP_USDC_PERP": 10,
     "PENGU_USDC_PERP": 10,
     "FARTCOIN_USDC_PERP": 10,
