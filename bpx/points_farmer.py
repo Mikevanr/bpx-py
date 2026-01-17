@@ -1,17 +1,15 @@
 """
-Backpack Exchange Points Farming Bot
+Backpack Exchange Momentum Scalper
 
-Autonomous scalping bot that maximizes trading volume (points) by detecting
-price wicks from Binance and executing maker-only trades on Backpack Exchange.
+High-frequency momentum scalping bot for BTC, ETH, SOL perpetuals.
+Follows short-term momentum with tight risk management.
 
-Features:
-- Trades 6 perpetual futures with appropriate leverage
-- Detects 0.3% wicks within 1 second from Binance stream
-- Maker-only entries with 0.1% TP and 0.2% SL
-- Auto-closes on SL hit or 30-second profit timeout
-- Tracks volume and estimated points per trade
-- Uses Backpack private websocket for real-time fill detection
-- Compares Binance and Backpack prices for optimal entry
+Strategy:
+- Detect momentum moves from Binance (0.08% in 3 seconds)
+- Enter WITH the momentum (not against it)
+- Tight TP (0.06%) and SL (0.10%) for quick trades
+- Use 50x leverage for maximum volume generation
+- Immediate taker entries for guaranteed fills
 
 Usage:
     from bpx.points_farmer import PointsFarmer
@@ -39,47 +37,59 @@ from bpx.async_.private_websocket import PrivateWebsocket
 # Configuration
 # =============================================================================
 
-# Trading pairs and their MAX leverage
-# WEEKEND MODE: Only PAXG (gold) - moves sideways when stock markets closed
+# Trading pairs - HIGH LIQUIDITY ONLY for tight spreads
 LEVERAGE: Dict[str, int] = {
-    "PAXG_USDC_PERP": 20,  # Gold - 20x max leverage
+    "BTC_USDC_PERP": 50,   # Bitcoin - most liquid
+    "ETH_USDC_PERP": 50,   # Ethereum - very liquid
+    "SOL_USDC_PERP": 50,   # Solana - good liquidity
 }
 
-# Map Backpack symbols to Binance stream names (for wick detection)
-# PAXG not on Binance futures - uses Backpack price feed only
-BINANCE_TICKERS: Dict[str, str] = {}
+# Binance price feeds for signal detection
+BINANCE_TICKERS: Dict[str, str] = {
+    "BTC_USDC_PERP": "btcusdt",
+    "ETH_USDC_PERP": "ethusdt",
+    "SOL_USDC_PERP": "solusdt",
+}
 
-# Reverse mapping: Binance ticker -> Backpack symbol
+# Reverse mapping
 BINANCE_TO_BACKPACK: Dict[str, str] = {v: k for k, v in BINANCE_TICKERS.items()}
 
-# Trading parameters
-# PAXG-only mode: Use full balance for single position
-WICK_THRESHOLD = 0.0005  # 0.05% - tighter for sideways gold market
-WICK_WINDOW_SECONDS = 2.0  # Time window for wick detection
-LEVERAGE_USAGE = 1.0  # Use full leverage
-MAX_CONCURRENT_POSITIONS = 1  # Single PAXG position
+# =============================================================================
+# MOMENTUM SCALPING PARAMETERS
+# =============================================================================
 
-# Exit parameters - MEAN REVERSION strategy
-# Quick TP (capture the bounce), wider SL (give room for volatility)
-TP_PERCENT = 0.0008  # 0.08% take profit - quick scalp on the reversion
-SL_PERCENT = 0.003  # 0.3% stop loss - wider to avoid getting stopped on noise
-MAX_LOSS_USDC = 8.00  # Close position if unrealized loss exceeds $8
-PROFIT_TIMEOUT_SECONDS = 20  # Close profitable position after 20s (faster exits)
-MIN_PROFIT_FOR_TIMEOUT = 0.0003  # 0.03% minimum profit to trigger timeout
+# Signal Detection
+MOMENTUM_THRESHOLD = 0.0008  # 0.08% move triggers entry
+MOMENTUM_WINDOW = 3.0        # Seconds to measure momentum
+MIN_VOLUME_RATIO = 1.5       # Volume must be 1.5x average to confirm signal
 
-# Emergency parameters - override maker-only when things heat up
-# These are higher thresholds for larger leveraged positions
-EMERGENCY_LOSS_USDC = 20.00  # Emergency market close if loss exceeds $20 (~0.7% on $2,833)
-EMERGENCY_LOSS_VELOCITY = 3.00  # Emergency close if losing more than $3/second
-EMERGENCY_LOSS_PERCENT = 0.008  # Emergency close if position down more than 0.8%
+# Position Sizing
+MAX_CONCURRENT_POSITIONS = 3  # One per symbol max
+LEVERAGE_USAGE = 0.8          # Use 80% of max leverage (safety margin)
+POSITION_SIZE_PCT = 0.30      # 30% of balance per position
 
-# Safety parameters
-COOLDOWN_SECONDS = 2  # Cooldown per symbol after trade attempt (reduced for more activity)
-MAX_LOSS_PER_SYMBOL = -50.0  # Pause symbol if cumulative loss exceeds $50
-STALE_ORDER_TIMEOUT = 5  # Cancel unfilled orders after 5 seconds (faster cycling)
-MAX_PRICE_DEVIATION = 0.02  # 2% max deviation from Binance price
+# Take Profit & Stop Loss (TIGHT for scalping)
+TP_PERCENT = 0.0006     # 0.06% take profit - quick scalps
+SL_PERCENT = 0.0010     # 0.10% stop loss - tight risk control
+TRAILING_STOP = True    # Enable trailing stop
+TRAILING_ACTIVATION = 0.0003  # Activate trailing after 0.03% profit
+TRAILING_DISTANCE = 0.0004    # Trail 0.04% behind price
 
-# Binance WebSocket - use combined stream endpoint
+# Risk Management
+MAX_LOSS_USDC = 5.00           # Hard stop per position
+MAX_DAILY_LOSS = 50.00         # Stop trading if daily loss exceeds this
+COOLDOWN_SECONDS = 1           # Fast cooldown for more trades
+MAX_POSITION_TIME = 60         # Force close after 60 seconds
+
+# Order Execution
+USE_TAKER_ORDERS = True        # Taker for immediate fills (more reliable)
+MAX_SLIPPAGE = 0.0003          # 0.03% max slippage allowed
+
+# Safety
+MAX_PRICE_DEVIATION = 0.005    # 0.5% max deviation Binance vs Backpack
+STALE_ORDER_TIMEOUT = 3        # Cancel unfilled limit orders after 3s
+
+# Binance WebSocket
 BINANCE_WS_URL = "wss://fstream.binance.com/stream"
 
 
@@ -96,6 +106,7 @@ class Side(Enum):
 class PricePoint:
     timestamp: float
     price: float
+    volume: float = 0.0  # Track volume for confirmation
 
 
 @dataclass
@@ -111,14 +122,17 @@ class Position:
     tp_price: Optional[float] = None
     sl_price: Optional[float] = None
     notional: float = 0.0
-    # For emergency velocity tracking
-    last_pnl: float = 0.0
-    last_pnl_time: float = 0.0
+    # Trailing stop tracking
+    highest_price: float = 0.0  # For longs - track highest since entry
+    lowest_price: float = 999999.0  # For shorts - track lowest since entry
+    trailing_active: bool = False
+    trailing_stop_price: float = 0.0
 
 
 @dataclass
 class SymbolState:
     prices: deque = field(default_factory=lambda: deque(maxlen=1000))
+    volumes: deque = field(default_factory=lambda: deque(maxlen=100))  # Track recent volumes
     last_trade_time: float = 0.0
     cumulative_pnl: float = 0.0
     paused: bool = False
@@ -133,7 +147,10 @@ class Stats:
     total_points: float = 0.0
     total_pnl: float = 0.0
     total_trades: int = 0
-    wicks_detected: int = 0
+    signals_detected: int = 0
+    wins: int = 0
+    losses: int = 0
+    daily_pnl: float = 0.0  # Track daily P/L for risk management
 
 
 # =============================================================================
@@ -306,19 +323,21 @@ class PointsFarmer:
                 return  # Unknown ticker, silently ignore
 
             price = float(trade_data["p"])
+            volume = float(trade_data.get("q", 0))  # Trade quantity
             timestamp = time.time()
 
-            # Update price history
+            # Update price and volume history
             state = self.states[symbol]
-            state.prices.append(PricePoint(timestamp, price))
+            state.prices.append(PricePoint(timestamp, price, volume))
+            state.volumes.append(volume)
             self._last_prices[symbol] = price
 
             # Debug: log first few messages
             if self.debug and self._msg_count <= 5:
-                print(f"[{symbol}] Price: {price}")
+                print(f"[{symbol}] Price: {price}, Vol: {volume}")
 
-            # Check for wick
-            await self._check_wick(symbol, state)
+            # Check for momentum signal
+            await self._check_momentum(symbol, state)
 
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             if self.debug:
@@ -563,11 +582,19 @@ class PointsFarmer:
         state.position = None
         state.pending_entry_order_id = None
 
-    async def _check_wick(self, symbol: str, state: SymbolState) -> None:
-        """Check if a wick signal has occurred."""
+    async def _check_momentum(self, symbol: str, state: SymbolState) -> None:
+        """Check for momentum signal - FOLLOW the trend."""
+        # Skip if paused or already in position
         if state.paused:
             return
         if state.position:
+            return
+
+        # Check daily loss limit
+        if self.stats.daily_pnl <= -MAX_DAILY_LOSS:
+            if not state.paused:
+                print(f"[{symbol}] PAUSED: Daily loss limit reached (${self.stats.daily_pnl:.2f})")
+                state.paused = True
             return
 
         # Cooldown check
@@ -581,39 +608,51 @@ class PointsFarmer:
         now = time.time()
         prices = state.prices
 
-        # Get prices within the time window
+        # Get prices within the momentum window
         window_prices = [
-            p for p in prices if now - p.timestamp <= WICK_WINDOW_SECONDS
+            p for p in prices if now - p.timestamp <= MOMENTUM_WINDOW
         ]
 
-        if len(window_prices) < 2:
+        if len(window_prices) < 5:  # Need enough data points
             return
 
-        # Calculate price change from oldest to newest in window
+        # Calculate momentum (price change over window)
         oldest_price = window_prices[0].price
         newest_price = window_prices[-1].price
-        price_change = (newest_price - oldest_price) / oldest_price
+        momentum = (newest_price - oldest_price) / oldest_price
 
-        # Detect wick and fade it (mean reversion)
-        if abs(price_change) >= WICK_THRESHOLD:
-            self.stats.wicks_detected += 1
-            direction = "WICK_DOWN" if price_change < 0 else "WICK_UP"
-            print(f"[{symbol}] {direction}: {price_change*100:.3f}% - FADING (mean reversion)", flush=True)
+        # Check if momentum exceeds threshold
+        if abs(momentum) < MOMENTUM_THRESHOLD:
+            return
 
-            # MEAN REVERSION STRATEGY: Fade the wick, expect price to revert
-            if price_change > 0:
-                # Price spiked UP -> go SHORT (expect it to come back down)
-                await self._enter_position(symbol, Side.SHORT)
-            else:
-                # Price spiked DOWN -> go LONG (expect it to bounce back up)
-                await self._enter_position(symbol, Side.LONG)
+        # Volume confirmation - check if recent volume is above average
+        if len(state.volumes) >= 10:
+            avg_volume = sum(state.volumes) / len(state.volumes)
+            recent_volume = sum(p.volume for p in window_prices[-5:])
+            volume_ratio = recent_volume / (avg_volume * 5) if avg_volume > 0 else 1.0
+
+            if volume_ratio < MIN_VOLUME_RATIO:
+                # Low volume move - skip (likely noise)
+                return
+
+        self.stats.signals_detected += 1
+        direction = "UP" if momentum > 0 else "DOWN"
+        print(f"[{symbol}] MOMENTUM {direction}: {momentum*100:.3f}% - FOLLOWING", flush=True)
+
+        # MOMENTUM FOLLOWING: Trade WITH the trend
+        if momentum > 0:
+            # Price moving UP -> go LONG (ride the wave)
+            await self._enter_position(symbol, Side.LONG)
+        else:
+            # Price moving DOWN -> go SHORT (ride the wave)
+            await self._enter_position(symbol, Side.SHORT)
 
     # =========================================================================
     # Trade Execution
     # =========================================================================
 
     async def _enter_position(self, symbol: str, side: Side) -> None:
-        """Place a maker-only limit entry order for 50% fee discount."""
+        """Enter position with market order for immediate fill."""
         state = self.states[symbol]
         side_str = "Long" if side == Side.LONG else "Short"
         print(f"[{symbol}] _enter_position called: {side_str}", flush=True)
@@ -621,27 +660,22 @@ class PointsFarmer:
         # Check max concurrent positions limit
         current_positions = sum(1 for s in self.states.values() if s.position is not None)
         if current_positions >= MAX_CONCURRENT_POSITIONS:
-            print(f"[{symbol}] BLOCKED: Max {MAX_CONCURRENT_POSITIONS} positions reached ({current_positions} open)")
+            print(f"[{symbol}] BLOCKED: Max {MAX_CONCURRENT_POSITIONS} positions reached")
             return
 
-        # Set cooldown immediately to prevent duplicate signals
+        # Set cooldown immediately
         state.last_trade_time = time.time()
 
         try:
-            # Get reference price (Binance if available, otherwise Backpack)
-            reference_price = self._last_prices.get(symbol) or self._backpack_prices.get(symbol)
-
+            # Get reference price from Binance
+            reference_price = self._last_prices.get(symbol)
             if not reference_price:
-                print(f"[{symbol}] BLOCKED: No price data available", flush=True)
+                print(f"[{symbol}] BLOCKED: No Binance price", flush=True)
                 return
 
-            # Fetch orderbook to get actual bid/ask prices
+            # Get Backpack orderbook for execution price
             try:
                 depth = await self.public.get_depth(symbol)
-                if not depth or "bids" not in depth or "asks" not in depth:
-                    print(f"[{symbol}] Could not get orderbook")
-                    return
-
                 bids = depth.get("bids", [])
                 asks = depth.get("asks", [])
 
@@ -649,82 +683,36 @@ class PointsFarmer:
                     print(f"[{symbol}] Empty orderbook")
                     return
 
-                # Explicitly find the HIGHEST bid and LOWEST ask
-                # (orderbook might not be sorted correctly)
-                bid_prices = [float(b[0]) for b in bids if float(b[0]) > 0]
-                ask_prices = [float(a[0]) for a in asks if float(a[0]) > 0]
+                best_bid = float(bids[0][0])
+                best_ask = float(asks[0][0])
+                spread_pct = (best_ask - best_bid) / best_bid * 100
 
-                if not bid_prices or not ask_prices:
-                    print(f"[{symbol}] No valid bid/ask prices")
+                # Check slippage vs Binance price
+                if side == Side.LONG:
+                    slippage = (best_ask - reference_price) / reference_price
+                else:
+                    slippage = (reference_price - best_bid) / reference_price
+
+                if slippage > MAX_SLIPPAGE:
+                    print(f"[{symbol}] Slippage too high: {slippage*100:.3f}%")
                     return
-
-                best_bid = max(bid_prices)  # Highest bid
-                best_ask = min(ask_prices)  # Lowest ask
-
-                # Sanity check: best_bid should be less than best_ask
-                if best_bid >= best_ask:
-                    print(f"[{symbol}] Invalid orderbook: bid {best_bid} >= ask {best_ask}")
-                    # Fall back to reference price
-                    best_bid = reference_price * 0.9999
-                    best_ask = reference_price * 1.0001
-
-                spread = (best_ask - best_bid) / best_bid * 100
-
-                # Sanity check: spread should be reasonable (< 1%)
-                if spread > 1.0:
-                    print(f"[{symbol}] Wide spread {spread:.2f}%, using reference price")
-                    best_bid = reference_price * 0.9999
-                    best_ask = reference_price * 1.0001
-                    spread = 0.02
-
-                if self.debug:
-                    print(f"[{symbol}] Orderbook: bid={best_bid:.2f}, ask={best_ask:.2f}, spread={spread:.4f}%")
 
             except Exception as e:
-                print(f"[{symbol}] Error fetching orderbook: {e}, using reference price")
-                best_bid = reference_price * 0.9999
-                best_ask = reference_price * 1.0001
+                print(f"[{symbol}] Orderbook error: {e}")
+                return
 
-            # Check price deviation between reference price and Backpack orderbook
-            # Skip this check if using Backpack-only (no Binance feed)
-            if symbol in BINANCE_TICKERS:
-                backpack_mid = (best_bid + best_ask) / 2
-                price_diff = abs(backpack_mid - reference_price) / reference_price
-                if price_diff > MAX_PRICE_DEVIATION:
-                    print(f"[{symbol}] Price deviation too high: {price_diff*100:.2f}%")
-                    return
-
-            # Calculate spread percentage
-            spread_pct = (best_ask - best_bid) / best_bid * 100
-
-            # ADAPTIVE PRICING based on spread width:
-            # - Wide spread (>= 0.02%): Use maker pricing (at best bid/ask)
-            # - Tight spread (< 0.02%): Cross the spread for immediate fills
-            if spread_pct >= 0.02:
-                # Wide spread - be a maker, sit on the book
-                if side == Side.LONG:
-                    entry_price = best_bid  # Join bid queue
-                else:
-                    entry_price = best_ask  # Join ask queue
-            else:
-                # Tight spread - cross for immediate fill
-                if side == Side.LONG:
-                    entry_price = best_ask  # Pay the ask to buy immediately
-                else:
-                    entry_price = best_bid  # Hit the bid to sell immediately
-
-            # Round price to appropriate precision
-            entry_price = self._round_price(symbol, entry_price)
-
-            # Calculate position size
+            # Calculate position size: POSITION_SIZE_PCT of balance * leverage
             balances = await self.account.get_balances()
             usdc_balance = self._get_usdc_balance(balances)
 
             leverage = LEVERAGE[symbol]
-            notional = usdc_balance * LEVERAGE_USAGE * leverage / MAX_CONCURRENT_POSITIONS
+            effective_leverage = leverage * LEVERAGE_USAGE
+            margin = usdc_balance * POSITION_SIZE_PCT
+            notional = margin * effective_leverage
+            entry_price = best_ask if side == Side.LONG else best_bid
             quantity = notional / entry_price
 
-            # Round quantity appropriately
+            # Round quantity
             quantity = self._round_quantity(symbol, quantity)
 
             if quantity <= 0:
@@ -732,39 +720,25 @@ class PointsFarmer:
                 return
 
             order_side = "Bid" if side == Side.LONG else "Ask"
-            side_str = "Long" if side == Side.LONG else "Short"
 
-            # If spread is very tight (< 0.02%), allow crossing spread for reliable fills
-            # Otherwise use post_only for maker fees
-            use_post_only = spread_pct >= 0.02
+            print(f"[{symbol}] MARKET {side_str} {quantity} @ ~${entry_price:.2f} (${notional:.0f} notional, {effective_leverage:.0f}x)")
 
-            order_type_str = "MAKER" if use_post_only else "TAKER"
-            print(f"[{symbol}] Placing {order_type_str} {side_str} {quantity} @ ${entry_price:.2f} (bid={best_bid:.2f}, ask={best_ask:.2f}, spread={spread_pct:.3f}%)")
-
-            # Use Limit GTC order - post_only only when spread is wide enough
-            order_params = {
-                "symbol": symbol,
-                "side": order_side,
-                "order_type": "Limit",
-                "quantity": str(quantity),
-                "price": str(entry_price),
-                "time_in_force": "GTC",
-            }
-            if use_post_only:
-                order_params["post_only"] = True
-
-            result = await self.account.execute_order(**order_params)
+            # Use MARKET order for immediate fill
+            result = await self.account.execute_order(
+                symbol=symbol,
+                side=order_side,
+                order_type="Market",
+                quantity=str(quantity),
+            )
 
             if isinstance(result, dict) and result.get("id"):
                 order_id = result["id"]
                 order_status = result.get("status", "")
                 executed_qty = float(result.get("executedQuantity", 0) or 0)
 
-                # Check if order filled immediately
                 if order_status == "Filled" or executed_qty > 0:
-                    # Get actual fill price (try multiple fields)
-                    fill_price = result.get("avgPrice") or result.get("price") or entry_price
-                    fill_price = float(fill_price) if fill_price else entry_price
+                    fill_price = float(result.get("avgPrice") or result.get("price") or entry_price)
+                    actual_qty = executed_qty if executed_qty > 0 else quantity
 
                     # Calculate TP and SL prices
                     if side == Side.LONG:
@@ -774,60 +748,33 @@ class PointsFarmer:
                         tp_price = fill_price * (1 - TP_PERCENT)
                         sl_price = fill_price * (1 + SL_PERCENT)
 
-                    # Create position (it's already filled!)
+                    # Create position with trailing stop tracking
                     state.position = Position(
                         symbol=symbol,
                         side=side,
                         entry_price=fill_price,
-                        quantity=executed_qty if executed_qty > 0 else quantity,
+                        quantity=actual_qty,
                         entry_time=time.time(),
                         order_id=order_id,
                         tp_price=tp_price,
                         sl_price=sl_price,
                         notional=notional,
+                        highest_price=fill_price,
+                        lowest_price=fill_price,
                     )
 
-                    print(f"*** ENTRY FILLED {symbol} {side_str} {state.position.quantity:.6f} @ {fill_price:.2f} ***")
-                    print(f"    TP @ {tp_price:.2f}, SL @ {sl_price:.2f}")
+                    print(f"*** FILLED {symbol} {side_str} {actual_qty:.6f} @ ${fill_price:.2f} ***")
+                    print(f"    TP: ${tp_price:.2f} | SL: ${sl_price:.2f}")
 
-                    # Place TP and SL orders immediately
-                    await self._place_tp_order(symbol, state.position)
-                    await self._place_sl_order(symbol, state.position)
-
-                    # Update stats for the entry
+                    # Update stats
                     self.stats.total_volume += notional
                     self.stats.total_points += notional
 
-                elif order_status == "Cancelled" or order_status == "Expired":
-                    print(f"[{symbol}] Order not filled (status: {order_status})")
                 else:
-                    # Order might be pending - set up tracking just in case
-                    state.pending_entry_order_id = order_id
-                    state.pending_entry_time = time.time()
-
-                    # Calculate TP and SL prices
-                    if side == Side.LONG:
-                        tp_price = entry_price * (1 + TP_PERCENT)
-                        sl_price = entry_price * (1 - SL_PERCENT)
-                    else:
-                        tp_price = entry_price * (1 - TP_PERCENT)
-                        sl_price = entry_price * (1 + SL_PERCENT)
-
-                    state.position = Position(
-                        symbol=symbol,
-                        side=side,
-                        entry_price=entry_price,
-                        quantity=quantity,
-                        entry_time=time.time(),
-                        order_id=order_id,
-                        tp_price=tp_price,
-                        sl_price=sl_price,
-                        notional=notional,
-                    )
-                    print(f"[{symbol}] Order placed, waiting for fill (status: {order_status})")
+                    print(f"[{symbol}] Order failed: {order_status}")
             else:
                 error_msg = result.get('message', result) if isinstance(result, dict) else result
-                print(f"[{symbol}] Order failed: {error_msg}")
+                print(f"[{symbol}] Order rejected: {error_msg}")
 
         except Exception as e:
             print(f"Entry error {symbol}: {e}")
@@ -1087,127 +1034,153 @@ class PointsFarmer:
     # =========================================================================
 
     async def _position_monitor_loop(self) -> None:
-        """Monitor positions for SL hits and profit timeouts."""
-        print("[MONITOR] Position monitor loop started", flush=True)
-        last_position_check = 0
-        last_status_log = 0
+        """Monitor positions with trailing stops."""
+        print("[MONITOR] Position monitor started", flush=True)
+        last_sync = 0
 
         while self._running:
             try:
-                # Periodically poll actual positions from Backpack to sync state
                 now = time.time()
-                if now - last_position_check >= 2:  # Check every 2 seconds
-                    last_position_check = now
-                    print("[MONITOR] Calling _sync_positions...", flush=True)
+
+                # Sync positions every 5 seconds
+                if now - last_sync >= 5:
+                    last_sync = now
                     await self._sync_positions()
-                    print("[MONITOR] _sync_positions returned", flush=True)
 
                 for symbol, state in self.states.items():
                     if not state.position:
                         continue
 
                     position = state.position
-
-                    # Use Backpack price for SL/TP checks (that's where we're trading!)
-                    current_price = self._backpack_prices.get(symbol)
+                    current_price = self._last_prices.get(symbol)
                     if not current_price:
-                        # Fall back to Binance price
-                        current_price = self._last_prices.get(symbol)
-                    if not current_price:
-                        print(f"[{symbol}] WARNING: No price data for SL check!")
                         continue
 
-                    # Skip SL/TP checks if entry order is still pending
-                    if state.pending_entry_order_id:
-                        print(f"[{symbol}] WARNING: Skipping SL check - pending entry order")
-                        continue
-
-                    # Calculate unrealized P/L in USDC
+                    # Calculate profit/loss
                     if position.side == Side.LONG:
+                        profit_pct = (current_price - position.entry_price) / position.entry_price
                         unrealized_pnl = (current_price - position.entry_price) * position.quantity
-                        loss_pct = (position.entry_price - current_price) / position.entry_price
+                        # Update highest price for trailing stop
+                        if current_price > position.highest_price:
+                            position.highest_price = current_price
                     else:
+                        profit_pct = (position.entry_price - current_price) / position.entry_price
                         unrealized_pnl = (position.entry_price - current_price) * position.quantity
-                        loss_pct = (current_price - position.entry_price) / position.entry_price
+                        # Update lowest price for trailing stop
+                        if current_price < position.lowest_price:
+                            position.lowest_price = current_price
 
-                    # Calculate loss velocity (how fast we're losing money)
-                    loss_velocity = 0.0
-                    if position.last_pnl_time > 0:
-                        time_diff = now - position.last_pnl_time
-                        if time_diff > 0:
-                            pnl_diff = position.last_pnl - unrealized_pnl  # Positive if losing more
-                            loss_velocity = pnl_diff / time_diff  # $/second
+                    time_held = now - position.entry_time
 
-                    # Update PnL tracking for velocity calculation
-                    position.last_pnl = unrealized_pnl
-                    position.last_pnl_time = now
-
-                    # Log position status every 5 seconds
-                    if now - last_status_log >= 5:
-                        last_status_log = now
-                        side_str = "LONG" if position.side == Side.LONG else "SHORT"
-                        time_held = now - position.entry_time
-                        velocity_str = f"vel=${loss_velocity:.2f}/s" if loss_velocity > 0.1 else ""
-                        print(f"[{symbol}] MONITOR: {side_str} | Entry={position.entry_price:.2f} Now={current_price:.2f} | uPnL=${unrealized_pnl:.2f} | SL={position.sl_price:.2f} MaxLoss=${-MAX_LOSS_USDC} | {time_held:.0f}s {velocity_str}")
-
-                    # ========== EMERGENCY CHECKS (market orders) ==========
-                    # These override maker-only strategy when things heat up
-
-                    # Emergency check 1: Absolute loss threshold
-                    if unrealized_pnl <= -EMERGENCY_LOSS_USDC:
-                        print(f"[{symbol}] 🚨 EMERGENCY LOSS: ${unrealized_pnl:.2f} <= -${EMERGENCY_LOSS_USDC}")
-                        await self._emergency_close(symbol, position, "EMERGENCY_LOSS")
+                    # ========== TAKE PROFIT ==========
+                    if profit_pct >= TP_PERCENT:
+                        await self._close_position(symbol, position, "TP", unrealized_pnl)
                         continue
 
-                    # Emergency check 2: Loss velocity (losing money too fast)
-                    if loss_velocity >= EMERGENCY_LOSS_VELOCITY:
-                        print(f"[{symbol}] 🚨 EMERGENCY VELOCITY: losing ${loss_velocity:.2f}/second!")
-                        await self._emergency_close(symbol, position, "EMERGENCY_VELOCITY")
-                        continue
+                    # ========== TRAILING STOP ==========
+                    if TRAILING_STOP and profit_pct >= TRAILING_ACTIVATION:
+                        if not position.trailing_active:
+                            position.trailing_active = True
+                            print(f"[{symbol}] Trailing stop ACTIVATED at {profit_pct*100:.3f}%")
 
-                    # Emergency check 3: Percentage loss threshold
-                    if loss_pct >= EMERGENCY_LOSS_PERCENT:
-                        print(f"[{symbol}] 🚨 EMERGENCY PERCENT: down {loss_pct*100:.2f}% >= {EMERGENCY_LOSS_PERCENT*100:.2f}%")
-                        await self._emergency_close(symbol, position, "EMERGENCY_PERCENT")
-                        continue
+                        # Calculate trailing stop price
+                        if position.side == Side.LONG:
+                            position.trailing_stop_price = position.highest_price * (1 - TRAILING_DISTANCE)
+                            if current_price <= position.trailing_stop_price:
+                                await self._close_position(symbol, position, "TRAIL", unrealized_pnl)
+                                continue
+                        else:
+                            position.trailing_stop_price = position.lowest_price * (1 + TRAILING_DISTANCE)
+                            if current_price >= position.trailing_stop_price:
+                                await self._close_position(symbol, position, "TRAIL", unrealized_pnl)
+                                continue
 
-                    # ========== NORMAL CHECKS ==========
-
-                    # Check MAX_LOSS_USDC (dollar-based stop loss)
-                    if unrealized_pnl <= -MAX_LOSS_USDC:
-                        print(f"[{symbol}] MAX LOSS HIT: ${unrealized_pnl:.2f} <= -${MAX_LOSS_USDC}")
-                        await self._close_position_market(symbol, position, "MAX_LOSS")
-                        continue
-
-                    # Check price-based SL
+                    # ========== STOP LOSS ==========
                     if position.side == Side.LONG:
                         if current_price <= position.sl_price:
-                            print(f"[{symbol}] SL HIT: price {current_price:.2f} <= SL {position.sl_price:.2f}")
-                            await self._close_position_market(symbol, position, "SL")
+                            await self._close_position(symbol, position, "SL", unrealized_pnl)
                             continue
-                        profit_pct = (current_price - position.entry_price) / position.entry_price
                     else:
                         if current_price >= position.sl_price:
-                            print(f"[{symbol}] SL HIT: price {current_price:.2f} >= SL {position.sl_price:.2f}")
-                            await self._close_position_market(symbol, position, "SL")
+                            await self._close_position(symbol, position, "SL", unrealized_pnl)
                             continue
-                        profit_pct = (position.entry_price - current_price) / position.entry_price
 
-                    # Check profit timeout - only if profit exceeds minimum threshold
-                    # This prevents closing positions that are barely in profit (noise)
-                    if profit_pct >= MIN_PROFIT_FOR_TIMEOUT:
-                        time_held = time.time() - position.entry_time
-                        if time_held >= PROFIT_TIMEOUT_SECONDS:
-                            print(f"[{symbol}] PROFIT TIMEOUT: {profit_pct*100:.3f}% profit after {time_held:.0f}s")
-                            await self._close_position_market(
-                                symbol, position, "PROFIT_TIMEOUT"
-                            )
+                    # ========== MAX LOSS (USDC) ==========
+                    if unrealized_pnl <= -MAX_LOSS_USDC:
+                        await self._close_position(symbol, position, "MAX_LOSS", unrealized_pnl)
+                        continue
+
+                    # ========== MAX TIME ==========
+                    if time_held >= MAX_POSITION_TIME:
+                        await self._close_position(symbol, position, "TIMEOUT", unrealized_pnl)
+                        continue
+
+                    # Log status every 10 seconds
+                    if int(time_held) % 10 == 0 and int(time_held) > 0:
+                        side_str = "L" if position.side == Side.LONG else "S"
+                        trail_str = f" TRAIL@{position.trailing_stop_price:.2f}" if position.trailing_active else ""
+                        print(f"[{symbol}] {side_str} {profit_pct*100:+.3f}% ${unrealized_pnl:+.2f} | {time_held:.0f}s{trail_str}")
 
             except Exception as e:
                 # Always log monitor errors - this is critical for SL execution
                 print(f"Monitor error: {e}")
 
             await asyncio.sleep(0.1)
+
+    async def _close_position(self, symbol: str, position: Position, reason: str, pnl: float) -> None:
+        """Close position with market order and update stats."""
+        state = self.states[symbol]
+
+        try:
+            close_side = "Ask" if position.side == Side.LONG else "Bid"
+
+            result = await self.account.execute_order(
+                symbol=symbol,
+                side=close_side,
+                order_type="Market",
+                quantity=str(position.quantity),
+                reduce_only=True,
+            )
+
+            # Get actual fill price
+            close_price = position.entry_price
+            if isinstance(result, dict):
+                close_price = float(result.get("avgPrice") or result.get("price") or close_price)
+
+            # Recalculate actual PnL
+            if position.side == Side.LONG:
+                actual_pnl = (close_price - position.entry_price) * position.quantity
+            else:
+                actual_pnl = (position.entry_price - close_price) * position.quantity
+
+            volume = position.notional * 2  # Entry + exit
+
+            # Update stats
+            self.stats.total_pnl += actual_pnl
+            self.stats.daily_pnl += actual_pnl
+            self.stats.total_volume += position.notional  # Exit volume
+            self.stats.total_points += position.notional
+            self.stats.total_trades += 1
+
+            if actual_pnl >= 0:
+                self.stats.wins += 1
+            else:
+                self.stats.losses += 1
+
+            state.cumulative_pnl += actual_pnl
+
+            # Log the close
+            side_str = "LONG" if position.side == Side.LONG else "SHORT"
+            pnl_str = f"+${actual_pnl:.2f}" if actual_pnl >= 0 else f"-${abs(actual_pnl):.2f}"
+            win_rate = self.stats.wins / self.stats.total_trades * 100 if self.stats.total_trades > 0 else 0
+
+            print(f"CLOSE {symbol} [{reason}] {side_str} | Entry=${position.entry_price:.2f} Exit=${close_price:.2f} | {pnl_str} | W/L: {self.stats.wins}/{self.stats.losses} ({win_rate:.0f}%)")
+
+            # Clear position
+            state.position = None
+
+        except Exception as e:
+            print(f"Close error {symbol}: {e}")
 
     async def _sync_positions(self) -> None:
         """Sync local state with actual positions on Backpack."""
@@ -1490,8 +1463,8 @@ class PointsFarmer:
                 if c is None:
                     return "n/a"
                 color_prefix = ""
-                if abs(c) >= WICK_THRESHOLD:
-                    color_prefix = "**"  # Highlight potential wick
+                if abs(c) >= MOMENTUM_THRESHOLD:
+                    color_prefix = "**"  # Highlight momentum signal
                 return f"{color_prefix}{c*100:+.3f}%"
 
             short_symbol = symbol.replace("_USDC_PERP", "").replace("_USDT_PERP", "").replace("_USD_PERP", "")
@@ -1507,11 +1480,12 @@ class PointsFarmer:
             )
 
         # Print summary stats
+        win_rate = self.stats.wins / self.stats.total_trades * 100 if self.stats.total_trades > 0 else 0
         print("-" * 85)
         print(
-            f"Msgs: {self._msg_count:,} | "
-            f"Wicks: {self.stats.wicks_detected} | "
+            f"Signals: {self.stats.signals_detected} | "
             f"Trades: {self.stats.total_trades} | "
+            f"W/L: {self.stats.wins}/{self.stats.losses} ({win_rate:.0f}%) | "
             f"Volume: ${self.stats.total_volume:,.0f} | "
             f"P/L: ${self.stats.total_pnl:+.2f}"
         )
