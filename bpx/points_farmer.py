@@ -40,133 +40,24 @@ from bpx.async_.private_websocket import PrivateWebsocket
 # =============================================================================
 
 # Trading pairs and their MAX leverage
+# WEEKEND MODE: Only PAXG (gold) - moves sideways when stock markets closed
 LEVERAGE: Dict[str, int] = {
-    # High liquidity
-    "BTC_USDC_PERP": 60,
-    "ETH_USDC_PERP": 50,
-    "SOL_USDC_PERP": 50,
-    # Medium liquidity (20x)
-    "BNB_USDC_PERP": 20,
-    "PAXG_USDC_PERP": 20,
-    # Medium liquidity (13x)
-    "HYPE_USDC_PERP": 13,
-    "ENA_USDC_PERP": 13,
-    # Standard liquidity (10x)
-    "APT_USDC_PERP": 10,
-    "ASTER_USDC_PERP": 10,
-    "SUI_USDC_PERP": 10,
-    "AAVE_USDC_PERP": 10,
-    "LINK_USDC_PERP": 10,
-    "XRP_USDC_PERP": 10,
-    "DOGE_USDC_PERP": 10,
-    "XLM_USDC_PERP": 10,
-    "ZEC_USDC_PERP": 10,
-    "MON_USDC_PERP": 10,
-    "AVAX_USDC_PERP": 10,
-    "NEAR_USDC_PERP": 10,
-    "TAO_USDC_PERP": 10,
-    "HBAR_USDC_PERP": 10,
-    "TON_USDC_PERP": 10,
-    "IP_USDC_PERP": 10,
-    "LTC_USDC_PERP": 10,
-    "CRV_USDC_PERP": 10,
-    "WLFI_USDC_PERP": 10,
-    "LINEA_USDC_PERP": 10,
-    "kBONK_USDC_PERP": 10,
-    "JTO_USDC_PERP": 10,
-    "SEI_USDC_PERP": 10,
-    "PENDLE_USDC_PERP": 10,
-    "JUP_USDC_PERP": 10,
-    "PENGU_USDC_PERP": 10,
-    "FARTCOIN_USDC_PERP": 10,
-    "ONDO_USDC_PERP": 10,
-    "MNT_USDC_PERP": 10,
-    "LDO_USDC_PERP": 10,
-    "UNI_USDC_PERP": 10,
-    "AERO_USDC_PERP": 10,
-    "DOT_USDC_PERP": 10,
-    "VIRTUAL_USDC_PERP": 10,
-    "WLD_USDC_PERP": 10,
-    "ADA_USDC_PERP": 10,
-    "kPEPE_USDC_PERP": 10,
-    "ARB_USDC_PERP": 10,
-    "WIF_USDC_PERP": 10,
-    "S_USDC_PERP": 10,
-    "FLOCK_USDC_PERP": 10,
-    "ZRO_USDC_PERP": 10,
-    "OP_USDC_PERP": 10,
-    "W_USDC_PERP": 10,
-    "ZORA_USDC_PERP": 10,
-    "PYTH_USDC_PERP": 10,
-    "XPL_USDC_PERP": 10,
-    "BERA_USDC_PERP": 10,
-    "TRUMP_USDC_PERP": 10,
-    "TIA_USDC_PERP": 10,
-    "KAITO_USDC_PERP": 10,
+    "PAXG_USDC_PERP": 20,  # Gold - 20x max leverage
 }
 
 # Map Backpack symbols to Binance stream names (for wick detection)
-# Tokens not on Binance will use Backpack price feed
-BINANCE_TICKERS: Dict[str, str] = {
-    "BTC_USDC_PERP": "btcusdt",
-    "ETH_USDC_PERP": "ethusdt",
-    "SOL_USDC_PERP": "solusdt",
-    "BNB_USDC_PERP": "bnbusdt",
-    "APT_USDC_PERP": "aptusdt",
-    "SUI_USDC_PERP": "suiusdt",
-    "AAVE_USDC_PERP": "aaveusdt",
-    "LINK_USDC_PERP": "linkusdt",
-    "XRP_USDC_PERP": "xrpusdt",
-    "DOGE_USDC_PERP": "dogeusdt",
-    "XLM_USDC_PERP": "xlmusdt",
-    "ZEC_USDC_PERP": "zecusdt",
-    "AVAX_USDC_PERP": "avaxusdt",
-    "NEAR_USDC_PERP": "nearusdt",
-    "TAO_USDC_PERP": "taousdt",
-    "HBAR_USDC_PERP": "hbarusdt",
-    "TON_USDC_PERP": "tonusdt",
-    "LTC_USDC_PERP": "ltcusdt",
-    "CRV_USDC_PERP": "crvusdt",
-    "WLFI_USDC_PERP": "wlfiusdt",
-    "JTO_USDC_PERP": "jtousdt",
-    "SEI_USDC_PERP": "seiusdt",
-    "PENDLE_USDC_PERP": "pendleusdt",
-    "ENA_USDC_PERP": "enausdt",
-    "JUP_USDC_PERP": "jupusdt",
-    "PENGU_USDC_PERP": "penguusdt",
-    "ONDO_USDC_PERP": "ondousdt",
-    "MNT_USDC_PERP": "mntusdt",
-    "LDO_USDC_PERP": "ldousdt",
-    "UNI_USDC_PERP": "uniusdt",
-    "DOT_USDC_PERP": "dotusdt",
-    "WLD_USDC_PERP": "wldusdt",
-    "ADA_USDC_PERP": "adausdt",
-    "ARB_USDC_PERP": "arbusdt",
-    "WIF_USDC_PERP": "wifusdt",
-    "ZRO_USDC_PERP": "zrousdt",
-    "OP_USDC_PERP": "opusdt",
-    "W_USDC_PERP": "wusdt",
-    "PYTH_USDC_PERP": "pythusdt",
-    "BERA_USDC_PERP": "berausdt",
-    "TRUMP_USDC_PERP": "trumpusdt",
-    "TIA_USDC_PERP": "tiausdt",
-    "KAITO_USDC_PERP": "kaitousdt",
-    # Tokens not on Binance futures - will use Backpack prices:
-    # PAXG, ASTER, HYPE, MON, IP, LINEA, kBONK, FARTCOIN, AERO, VIRTUAL,
-    # kPEPE, S, FLOCK, ZORA, XPL
-}
+# PAXG not on Binance futures - uses Backpack price feed only
+BINANCE_TICKERS: Dict[str, str] = {}
 
 # Reverse mapping: Binance ticker -> Backpack symbol
 BINANCE_TO_BACKPACK: Dict[str, str] = {v: k for k, v in BINANCE_TICKERS.items()}
 
 # Trading parameters
-# Position sizing: Balance divided by MAX_CONCURRENT_POSITIONS (not total symbols)
-# Example: $170 balance / 10 max positions = $17 margin per position
-# With 10x leverage: $17 * 10 = $170 notional per trade
-WICK_THRESHOLD = 0.001  # 0.1% price move - only trade significant wicks
-WICK_WINDOW_SECONDS = 2.0  # Time window for wick detection (shorter = faster reaction)
+# PAXG-only mode: Use full balance for single position
+WICK_THRESHOLD = 0.0005  # 0.05% - tighter for sideways gold market
+WICK_WINDOW_SECONDS = 2.0  # Time window for wick detection
 LEVERAGE_USAGE = 1.0  # Use full leverage
-MAX_CONCURRENT_POSITIONS = 10  # Max positions open at once (determines margin per trade)
+MAX_CONCURRENT_POSITIONS = 1  # Single PAXG position
 
 # Exit parameters - MEAN REVERSION strategy
 # Quick TP (capture the bounce), wider SL (give room for volatility)
@@ -354,6 +245,11 @@ class PointsFarmer:
 
     async def _binance_stream_loop(self) -> None:
         """Connect to Binance and process trade stream."""
+        # Skip Binance stream if no tickers configured (e.g., PAXG-only mode)
+        if not BINANCE_TICKERS:
+            print("No Binance tickers configured - using Backpack prices only")
+            return
+
         # Build combined stream URL correctly
         streams = [f"{ticker}@aggTrade" for ticker in BINANCE_TICKERS.values()]
         streams_param = "/".join(streams)
@@ -732,11 +628,11 @@ class PointsFarmer:
         state.last_trade_time = time.time()
 
         try:
-            # Get both Binance and Backpack prices
-            binance_price = self._last_prices.get(symbol)
+            # Get reference price (Binance if available, otherwise Backpack)
+            reference_price = self._last_prices.get(symbol) or self._backpack_prices.get(symbol)
 
-            if not binance_price:
-                print(f"[{symbol}] BLOCKED: No Binance price available", flush=True)
+            if not reference_price:
+                print(f"[{symbol}] BLOCKED: No price data available", flush=True)
                 return
 
             # Fetch orderbook to get actual bid/ask prices
@@ -768,33 +664,35 @@ class PointsFarmer:
                 # Sanity check: best_bid should be less than best_ask
                 if best_bid >= best_ask:
                     print(f"[{symbol}] Invalid orderbook: bid {best_bid} >= ask {best_ask}")
-                    # Fall back to Binance price
-                    best_bid = binance_price * 0.9999
-                    best_ask = binance_price * 1.0001
+                    # Fall back to reference price
+                    best_bid = reference_price * 0.9999
+                    best_ask = reference_price * 1.0001
 
                 spread = (best_ask - best_bid) / best_bid * 100
 
                 # Sanity check: spread should be reasonable (< 1%)
                 if spread > 1.0:
-                    print(f"[{symbol}] Wide spread {spread:.2f}%, using Binance price")
-                    best_bid = binance_price * 0.9999
-                    best_ask = binance_price * 1.0001
+                    print(f"[{symbol}] Wide spread {spread:.2f}%, using reference price")
+                    best_bid = reference_price * 0.9999
+                    best_ask = reference_price * 1.0001
                     spread = 0.02
 
                 if self.debug:
                     print(f"[{symbol}] Orderbook: bid={best_bid:.2f}, ask={best_ask:.2f}, spread={spread:.4f}%")
 
             except Exception as e:
-                print(f"[{symbol}] Error fetching orderbook: {e}, using Binance price")
-                best_bid = binance_price * 0.9999
-                best_ask = binance_price * 1.0001
+                print(f"[{symbol}] Error fetching orderbook: {e}, using reference price")
+                best_bid = reference_price * 0.9999
+                best_ask = reference_price * 1.0001
 
-            # Check price deviation between Binance and Backpack mid
-            backpack_mid = (best_bid + best_ask) / 2
-            price_diff = abs(backpack_mid - binance_price) / binance_price
-            if price_diff > MAX_PRICE_DEVIATION:
-                print(f"[{symbol}] Price deviation too high: {price_diff*100:.2f}%")
-                return
+            # Check price deviation between reference price and Backpack orderbook
+            # Skip this check if using Backpack-only (no Binance feed)
+            if symbol in BINANCE_TICKERS:
+                backpack_mid = (best_bid + best_ask) / 2
+                price_diff = abs(backpack_mid - reference_price) / reference_price
+                if price_diff > MAX_PRICE_DEVIATION:
+                    print(f"[{symbol}] Price deviation too high: {price_diff*100:.2f}%")
+                    return
 
             # Calculate spread percentage
             spread_pct = (best_ask - best_bid) / best_bid * 100
