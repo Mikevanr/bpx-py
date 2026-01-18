@@ -71,7 +71,7 @@ def main():
         print("  python points_farmer_example.py --public-key KEY --secret-key KEY")
         sys.exit(1)
 
-    print("Starting Backpack Points Farmer...")
+    print("Starting Momentum Scalper...")
     print()
 
     bot = PointsFarmer(
