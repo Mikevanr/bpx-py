@@ -207,12 +207,12 @@ class PointsFarmer:
         """Main entry point - runs the bot forever."""
         self._running = True
         print("=" * 60)
-        print("BACKPACK POINTS FARMER")
+        print("MOMENTUM SCALPER - BTC/ETH/SOL")
         print("=" * 60)
         print(f"Trading pairs: {list(LEVERAGE.keys())}")
-        print(f"Binance feeds: {list(BINANCE_TICKERS.values())}")
-        print(f"Wick threshold: {WICK_THRESHOLD * 100}%")
+        print(f"Momentum threshold: {MOMENTUM_THRESHOLD * 100}% in {MOMENTUM_WINDOW}s")
         print(f"TP: {TP_PERCENT * 100}% | SL: {SL_PERCENT * 100}%")
+        print(f"Trailing: {TRAILING_ACTIVATION * 100}% activate, {TRAILING_DISTANCE * 100}% trail")
         print("=" * 60)
 
         try:
