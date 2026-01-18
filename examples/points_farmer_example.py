@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Backpack Exchange Points Farming Bot
+Backpack Exchange Momentum Scalper
 
-Autonomous scalping bot that maximizes trading volume (points) by detecting
-price wicks from Binance and executing maker-only trades on Backpack Exchange.
+High-frequency momentum scalping bot for BTC, ETH, SOL perpetuals.
+Follows short-term momentum with tight risk management.
 
 Setup:
     export BPX_PUBLIC_KEY="your_public_key"
@@ -13,19 +13,18 @@ Setup:
 Or run directly with keys:
     python examples/points_farmer_example.py --public-key KEY --secret-key KEY
 
-Features:
-    - Trades 6 perpetual futures: BTC, ETH, SOL (50x), ZEC, 2Z, MON (10x)
-    - Detects 0.3% wicks from Binance real-time stream
-    - Maker-only entries at best bid/ask
-    - TP at +0.1%, SL at -0.2%
-    - Auto-closes profitable positions after 30 seconds
-    - Tracks volume and estimated points
+Strategy:
+    - Trades BTC, ETH, SOL with 50x leverage
+    - Detects 0.08% momentum in 3 seconds from Binance
+    - Market orders for immediate fills
+    - TP: 0.06% | SL: 0.10%
+    - Trailing stop: activates at 0.03%, trails 0.04%
 
-Safety:
-    - 3-second cooldown per symbol
-    - Pauses symbol if cumulative loss exceeds $15
-    - Cancels stale orders after 10 seconds
-    - Uses only 30% of max leverage per symbol
+Risk Management:
+    - Max 3 concurrent positions
+    - Max $5 loss per position
+    - Max $50 daily loss limit
+    - 60 second max hold time
 """
 
 import asyncio
