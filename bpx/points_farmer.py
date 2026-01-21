@@ -58,32 +58,33 @@ BINANCE_TO_BACKPACK: Dict[str, str] = {v: k for k, v in BINANCE_TICKERS.items()}
 # MOMENTUM SCALPING PARAMETERS
 # =============================================================================
 
-# Signal Detection
-MOMENTUM_THRESHOLD = 0.0008  # 0.08% move triggers entry
-MOMENTUM_WINDOW = 3.0        # Seconds to measure momentum
-MIN_VOLUME_RATIO = 1.5       # Volume must be 1.5x average to confirm signal
+# Signal Detection (tuned for more frequent trades)
+MOMENTUM_THRESHOLD = 0.0003  # 0.03% move triggers entry (was 0.08%)
+MOMENTUM_WINDOW = 5.0        # Seconds to measure momentum (was 3s)
+MIN_VOLUME_RATIO = 0.8       # Volume must be 0.8x average (was 1.5x - too strict)
 
 # Position Sizing
 MAX_CONCURRENT_POSITIONS = 3  # One per symbol max
 LEVERAGE_USAGE = 0.8          # Use 80% of max leverage (safety margin)
 POSITION_SIZE_PCT = 0.30      # 30% of balance per position
 
-# Take Profit & Stop Loss (TIGHT for scalping)
-TP_PERCENT = 0.0006     # 0.06% take profit - quick scalps
-SL_PERCENT = 0.0010     # 0.10% stop loss - tight risk control
+# Take Profit & Stop Loss (based on LEVERAGED P/L, not asset price)
+# These are returns on margin, e.g., 3% = 3% profit on your margin
+TP_PERCENT = 0.03       # 3% take profit on margin
+SL_PERCENT = 0.05       # 5% stop loss on margin
 TRAILING_STOP = True    # Enable trailing stop
-TRAILING_ACTIVATION = 0.0003  # Activate trailing after 0.03% profit
-TRAILING_DISTANCE = 0.0004    # Trail 0.04% behind price
+TRAILING_ACTIVATION = 0.015   # Activate trailing after 1.5% profit on margin
+TRAILING_DISTANCE = 0.02      # Trail 2% behind on margin
 
 # Risk Management
 MAX_LOSS_USDC = 5.00           # Hard stop per position
 MAX_DAILY_LOSS = 50.00         # Stop trading if daily loss exceeds this
 COOLDOWN_SECONDS = 1           # Fast cooldown for more trades
-MAX_POSITION_TIME = 60         # Force close after 60 seconds
+MAX_POSITION_TIME = 300        # Force close after 5 minutes (was 60s)
 
 # Order Execution
-USE_TAKER_ORDERS = True        # Taker for immediate fills (more reliable)
-MAX_SLIPPAGE = 0.0003          # 0.03% max slippage allowed
+USE_TAKER_ORDERS = False       # Prefer maker orders for lower fees
+MAX_SLIPPAGE = 0.001           # 0.1% max slippage allowed (was 0.03%)
 
 # Safety
 MAX_PRICE_DEVIATION = 0.005    # 0.5% max deviation Binance vs Backpack
@@ -122,11 +123,15 @@ class Position:
     tp_price: Optional[float] = None
     sl_price: Optional[float] = None
     notional: float = 0.0
+    margin: float = 0.0  # Initial margin used for this position
+    leverage: float = 1.0  # Leverage used for this position
     # Trailing stop tracking
     highest_price: float = 0.0  # For longs - track highest since entry
     lowest_price: float = 999999.0  # For shorts - track lowest since entry
     trailing_active: bool = False
     trailing_stop_price: float = 0.0
+    highest_margin_pnl_pct: float = 0.0  # Track highest margin P/L % for trailing
+    lowest_margin_pnl_pct: float = 0.0   # Track lowest margin P/L % for trailing
 
 
 @dataclass
@@ -210,16 +215,18 @@ class PointsFarmer:
         print("MOMENTUM SCALPER - BTC/ETH/SOL")
         print("=" * 60)
         print(f"Trading pairs: {list(LEVERAGE.keys())}")
+        print(f"Leverage: 50x | Order type: {'Taker' if USE_TAKER_ORDERS else 'Maker (lower fees)'}")
         print(f"Momentum threshold: {MOMENTUM_THRESHOLD * 100}% in {MOMENTUM_WINDOW}s")
-        print(f"TP: {TP_PERCENT * 100}% | SL: {SL_PERCENT * 100}%")
-        print(f"Trailing: {TRAILING_ACTIVATION * 100}% activate, {TRAILING_DISTANCE * 100}% trail")
+        print(f"TP: {TP_PERCENT * 100}% margin | SL: {SL_PERCENT * 100}% margin (leveraged P/L)")
+        print(f"Trailing: {TRAILING_ACTIVATION * 100}% activate, {TRAILING_DISTANCE * 100}% trail (margin %)")
+        print(f"Position size: {POSITION_SIZE_PCT * 100}% of balance | Leverage usage: {LEVERAGE_USAGE * 100}%")
         print("=" * 60)
 
         try:
-            # Get initial balance
-            balances = await self.account.get_balances()
-            usdc_balance = self._get_usdc_balance(balances)
-            print(f"Starting USDC balance: ${usdc_balance:.2f}")
+            # Get initial balance from collateral (for perps trading)
+            collateral = await self.account.get_collateral()
+            usdc_balance = self._get_usdc_balance(collateral)
+            print(f"Starting USDC balance (perps): ${usdc_balance:.2f}")
 
             # Connect to Backpack private websocket for real-time updates
             await self._connect_private_websocket()
@@ -438,17 +445,8 @@ class PointsFarmer:
                     if state.position:
                         state.position.entry_time = time.time()
                         state.position.entry_price = float(price) if price else state.position.entry_price
-                        # Place TP and SL orders
-                        await self._place_tp_order(symbol, state.position)
-                        await self._place_sl_order(symbol, state.position)
-
-                elif state and state.position and state.position.tp_order_id == order_id:
-                    # TP order filled
-                    await self._handle_tp_fill(symbol, state, float(price) if price else None)
-
-                elif state and state.position and state.position.sl_order_id == order_id:
-                    # SL order filled
-                    await self._handle_sl_fill(symbol, state, float(price) if price else None)
+                        # TP/SL is now handled by position monitor based on margin P/L %
+                        print(f"    TP: {TP_PERCENT*100:.1f}% margin | SL: {SL_PERCENT*100:.1f}% margin")
 
             elif status == "Cancelled":
                 state = self.states.get(symbol)
@@ -517,9 +515,15 @@ class PointsFarmer:
         # Update stats
         state.cumulative_pnl += pnl_usdc
         self.stats.total_pnl += pnl_usdc
+        self.stats.daily_pnl += pnl_usdc
         self.stats.total_volume += volume
         self.stats.total_points += volume
         self.stats.total_trades += 1
+
+        if pnl_usdc >= 0:
+            self.stats.wins += 1
+        else:
+            self.stats.losses += 1
 
         pnl_sign = "+" if pnl_usdc >= 0 else ""
         print(
@@ -559,9 +563,15 @@ class PointsFarmer:
         # Update stats
         state.cumulative_pnl += pnl_usdc
         self.stats.total_pnl += pnl_usdc
+        self.stats.daily_pnl += pnl_usdc
         self.stats.total_volume += volume
         self.stats.total_points += volume
         self.stats.total_trades += 1
+
+        if pnl_usdc >= 0:
+            self.stats.wins += 1
+        else:
+            self.stats.losses += 1
 
         pnl_sign = "+" if pnl_usdc >= 0 else ""
         print(
@@ -613,7 +623,7 @@ class PointsFarmer:
             p for p in prices if now - p.timestamp <= MOMENTUM_WINDOW
         ]
 
-        if len(window_prices) < 5:  # Need enough data points
+        if len(window_prices) < 3:  # Need enough data points (reduced from 5)
             return
 
         # Calculate momentum (price change over window)
@@ -626,7 +636,7 @@ class PointsFarmer:
             return
 
         # Volume confirmation - check if recent volume is above average
-        if len(state.volumes) >= 10:
+        if len(state.volumes) >= 5:  # Reduced from 10
             avg_volume = sum(state.volumes) / len(state.volumes)
             recent_volume = sum(p.volume for p in window_prices[-5:])
             volume_ratio = recent_volume / (avg_volume * 5) if avg_volume > 0 else 1.0
@@ -702,8 +712,8 @@ class PointsFarmer:
                 return
 
             # Calculate position size: POSITION_SIZE_PCT of balance * leverage
-            balances = await self.account.get_balances()
-            usdc_balance = self._get_usdc_balance(balances)
+            collateral = await self.account.get_collateral()
+            usdc_balance = self._get_usdc_balance(collateral)
 
             leverage = LEVERAGE[symbol]
             effective_leverage = leverage * LEVERAGE_USAGE
@@ -721,15 +731,27 @@ class PointsFarmer:
 
             order_side = "Bid" if side == Side.LONG else "Ask"
 
-            print(f"[{symbol}] MARKET {side_str} {quantity} @ ~${entry_price:.2f} (${notional:.0f} notional, {effective_leverage:.0f}x)")
-
-            # Use MARKET order for immediate fill
-            result = await self.account.execute_order(
-                symbol=symbol,
-                side=order_side,
-                order_type="Market",
-                quantity=str(quantity),
-            )
+            # Use limit order for maker fees, or market order for immediate fill
+            if USE_TAKER_ORDERS:
+                print(f"[{symbol}] MARKET {side_str} {quantity} @ ~${entry_price:.2f} (${notional:.0f} notional, {effective_leverage:.0f}x)")
+                result = await self.account.execute_order(
+                    symbol=symbol,
+                    side=order_side,
+                    order_type="Market",
+                    quantity=str(quantity),
+                )
+            else:
+                # Use limit order at current price for maker fees
+                limit_price = self._round_price(symbol, entry_price)
+                print(f"[{symbol}] LIMIT {side_str} {quantity} @ ${limit_price:.2f} (${notional:.0f} notional, {effective_leverage:.0f}x)")
+                result = await self.account.execute_order(
+                    symbol=symbol,
+                    side=order_side,
+                    order_type="Limit",
+                    quantity=str(quantity),
+                    price=str(limit_price),
+                    time_in_force="IOC",  # Immediate-or-cancel to avoid hanging orders
+                )
 
             if isinstance(result, dict) and result.get("id"):
                 order_id = result["id"]
@@ -739,16 +761,10 @@ class PointsFarmer:
                 if order_status == "Filled" or executed_qty > 0:
                     fill_price = float(result.get("avgPrice") or result.get("price") or entry_price)
                     actual_qty = executed_qty if executed_qty > 0 else quantity
+                    actual_notional = fill_price * actual_qty
+                    actual_margin = actual_notional / effective_leverage
 
-                    # Calculate TP and SL prices
-                    if side == Side.LONG:
-                        tp_price = fill_price * (1 + TP_PERCENT)
-                        sl_price = fill_price * (1 - SL_PERCENT)
-                    else:
-                        tp_price = fill_price * (1 - TP_PERCENT)
-                        sl_price = fill_price * (1 + SL_PERCENT)
-
-                    # Create position with trailing stop tracking
+                    # Create position with margin tracking for leveraged P/L
                     state.position = Position(
                         symbol=symbol,
                         side=side,
@@ -756,15 +772,15 @@ class PointsFarmer:
                         quantity=actual_qty,
                         entry_time=time.time(),
                         order_id=order_id,
-                        tp_price=tp_price,
-                        sl_price=sl_price,
-                        notional=notional,
+                        notional=actual_notional,
+                        margin=actual_margin,
+                        leverage=effective_leverage,
                         highest_price=fill_price,
                         lowest_price=fill_price,
                     )
 
                     print(f"*** FILLED {symbol} {side_str} {actual_qty:.6f} @ ${fill_price:.2f} ***")
-                    print(f"    TP: ${tp_price:.2f} | SL: ${sl_price:.2f}")
+                    print(f"    Notional: ${actual_notional:.0f} | Margin: ${actual_margin:.2f} | Leverage: {effective_leverage:.0f}x")
 
                     # Update stats
                     self.stats.total_volume += notional
@@ -904,9 +920,15 @@ class PointsFarmer:
             # Update stats
             state.cumulative_pnl += pnl_usdc
             self.stats.total_pnl += pnl_usdc
+            self.stats.daily_pnl += pnl_usdc
             self.stats.total_volume += volume
             self.stats.total_points += volume
             self.stats.total_trades += 1
+
+            if pnl_usdc >= 0:
+                self.stats.wins += 1
+            else:
+                self.stats.losses += 1
 
             # Check if symbol should be paused
             if state.cumulative_pnl < MAX_LOSS_PER_SYMBOL:
@@ -991,9 +1013,15 @@ class PointsFarmer:
             # Update stats
             state.cumulative_pnl += pnl_usdc
             self.stats.total_pnl += pnl_usdc
+            self.stats.daily_pnl += pnl_usdc
             self.stats.total_volume += volume
             self.stats.total_points += volume
             self.stats.total_trades += 1
+
+            if pnl_usdc >= 0:
+                self.stats.wins += 1
+            else:
+                self.stats.losses += 1
 
             # Check if symbol should be paused
             if state.cumulative_pnl < MAX_LOSS_PER_SYMBOL:
@@ -1056,54 +1084,50 @@ class PointsFarmer:
                     if not current_price:
                         continue
 
-                    # Calculate profit/loss
+                    # Calculate profit/loss in USDC and as % of margin (leveraged P/L)
                     if position.side == Side.LONG:
-                        profit_pct = (current_price - position.entry_price) / position.entry_price
                         unrealized_pnl = (current_price - position.entry_price) * position.quantity
                         # Update highest price for trailing stop
                         if current_price > position.highest_price:
                             position.highest_price = current_price
                     else:
-                        profit_pct = (position.entry_price - current_price) / position.entry_price
                         unrealized_pnl = (position.entry_price - current_price) * position.quantity
                         # Update lowest price for trailing stop
                         if current_price < position.lowest_price:
                             position.lowest_price = current_price
 
+                    # Calculate margin P/L % (leveraged return on margin)
+                    margin_pnl_pct = unrealized_pnl / position.margin if position.margin > 0 else 0
+
+                    # Track highest/lowest margin P/L for trailing stop
+                    if margin_pnl_pct > position.highest_margin_pnl_pct:
+                        position.highest_margin_pnl_pct = margin_pnl_pct
+                    if margin_pnl_pct < position.lowest_margin_pnl_pct:
+                        position.lowest_margin_pnl_pct = margin_pnl_pct
+
                     time_held = now - position.entry_time
 
-                    # ========== TAKE PROFIT ==========
-                    if profit_pct >= TP_PERCENT:
+                    # ========== TAKE PROFIT (based on margin P/L %) ==========
+                    if margin_pnl_pct >= TP_PERCENT:
                         await self._close_position(symbol, position, "TP", unrealized_pnl)
                         continue
 
-                    # ========== TRAILING STOP ==========
-                    if TRAILING_STOP and profit_pct >= TRAILING_ACTIVATION:
+                    # ========== TRAILING STOP (based on margin P/L %) ==========
+                    if TRAILING_STOP and margin_pnl_pct >= TRAILING_ACTIVATION:
                         if not position.trailing_active:
                             position.trailing_active = True
-                            print(f"[{symbol}] Trailing stop ACTIVATED at {profit_pct*100:.3f}%")
+                            print(f"[{symbol}] Trailing stop ACTIVATED at {margin_pnl_pct*100:.2f}% margin P/L")
 
-                        # Calculate trailing stop price
-                        if position.side == Side.LONG:
-                            position.trailing_stop_price = position.highest_price * (1 - TRAILING_DISTANCE)
-                            if current_price <= position.trailing_stop_price:
-                                await self._close_position(symbol, position, "TRAIL", unrealized_pnl)
-                                continue
-                        else:
-                            position.trailing_stop_price = position.lowest_price * (1 + TRAILING_DISTANCE)
-                            if current_price >= position.trailing_stop_price:
-                                await self._close_position(symbol, position, "TRAIL", unrealized_pnl)
-                                continue
+                        # Check if we've dropped TRAILING_DISTANCE below the peak
+                        trailing_trigger = position.highest_margin_pnl_pct - TRAILING_DISTANCE
+                        if margin_pnl_pct <= trailing_trigger:
+                            await self._close_position(symbol, position, "TRAIL", unrealized_pnl)
+                            continue
 
-                    # ========== STOP LOSS ==========
-                    if position.side == Side.LONG:
-                        if current_price <= position.sl_price:
-                            await self._close_position(symbol, position, "SL", unrealized_pnl)
-                            continue
-                    else:
-                        if current_price >= position.sl_price:
-                            await self._close_position(symbol, position, "SL", unrealized_pnl)
-                            continue
+                    # ========== STOP LOSS (based on margin P/L %) ==========
+                    if margin_pnl_pct <= -SL_PERCENT:
+                        await self._close_position(symbol, position, "SL", unrealized_pnl)
+                        continue
 
                     # ========== MAX LOSS (USDC) ==========
                     if unrealized_pnl <= -MAX_LOSS_USDC:
@@ -1118,8 +1142,8 @@ class PointsFarmer:
                     # Log status every 10 seconds
                     if int(time_held) % 10 == 0 and int(time_held) > 0:
                         side_str = "L" if position.side == Side.LONG else "S"
-                        trail_str = f" TRAIL@{position.trailing_stop_price:.2f}" if position.trailing_active else ""
-                        print(f"[{symbol}] {side_str} {profit_pct*100:+.3f}% ${unrealized_pnl:+.2f} | {time_held:.0f}s{trail_str}")
+                        trail_str = f" TRAIL@{position.highest_margin_pnl_pct*100:.1f}%" if position.trailing_active else ""
+                        print(f"[{symbol}] {side_str} {margin_pnl_pct*100:+.2f}% margin | ${unrealized_pnl:+.2f} | {time_held:.0f}s{trail_str}")
 
             except Exception as e:
                 # Always log monitor errors - this is critical for SL execution
@@ -1236,9 +1260,8 @@ class PointsFarmer:
                             state.position.entry_price = actual_entry
                             state.position.quantity = abs(actual_size)
                             state.position.entry_time = time.time()
-                            # Place TP and SL orders
-                            await self._place_tp_order(symbol, state.position)
-                            await self._place_sl_order(symbol, state.position)
+                            # TP/SL is handled by position monitor based on margin P/L %
+                            print(f"    TP: {TP_PERCENT*100:.1f}% margin | SL: {SL_PERCENT*100:.1f}% margin")
                     else:
                         # No pending entry - check if position is still open
                         if abs(actual_size) < 0.00001:
@@ -1258,9 +1281,15 @@ class PointsFarmer:
                                 # Update stats
                                 state.cumulative_pnl += pnl_usdc
                                 self.stats.total_pnl += pnl_usdc
+                                self.stats.daily_pnl += pnl_usdc
                                 self.stats.total_volume += volume
                                 self.stats.total_points += volume
                                 self.stats.total_trades += 1
+
+                                if pnl_usdc >= 0:
+                                    self.stats.wins += 1
+                                else:
+                                    self.stats.losses += 1
 
                                 pnl_sign = "+" if pnl_usdc >= 0 else ""
                                 print(
@@ -1348,37 +1377,28 @@ class PointsFarmer:
             side = Side.LONG if net_qty > 0 else Side.SHORT
             quantity = abs(net_qty)
 
-            # Calculate TP and SL prices based on entry
-            if side == Side.LONG:
-                tp_price = entry_price * (1 + TP_PERCENT)
-                sl_price = entry_price * (1 - SL_PERCENT)
-            else:
-                tp_price = entry_price * (1 - TP_PERCENT)
-                sl_price = entry_price * (1 + SL_PERCENT)
+            # Get leverage for this symbol
+            leverage = LEVERAGE.get(symbol, 50) * LEVERAGE_USAGE
+            margin = notional_value / leverage
 
-            # Round prices
-            tp_price = self._round_price(symbol, tp_price)
-            sl_price = self._round_price(symbol, sl_price)
-
-            # Create position object
+            # Create position object with margin tracking
             state.position = Position(
                 symbol=symbol,
                 side=side,
                 entry_price=entry_price,
                 quantity=quantity,
                 entry_time=time.time(),  # We don't know actual entry time
-                tp_price=tp_price,
-                sl_price=sl_price,
                 notional=notional_value,
+                margin=margin,
+                leverage=leverage,
+                highest_price=entry_price,
+                lowest_price=entry_price,
             )
 
             side_str = "Long" if side == Side.LONG else "Short"
             print(f"*** ADOPTED POSITION: {symbol} {side_str} {quantity:.6f} @ {entry_price:.2f} ***")
-            print(f"    TP @ {tp_price:.2f}, SL @ {sl_price:.2f}, Notional: ${notional_value:.2f}")
-
-            # Place TP and SL orders for the adopted position
-            await self._place_tp_order(symbol, state.position)
-            await self._place_sl_order(symbol, state.position)
+            print(f"    Notional: ${notional_value:.2f} | Margin: ${margin:.2f} | Leverage: {leverage:.0f}x")
+            print(f"    TP: {TP_PERCENT*100:.1f}% margin | SL: {SL_PERCENT*100:.1f}% margin")
 
         except Exception as e:
             print(f"Error adopting position {symbol}: {e}")
@@ -1516,14 +1536,17 @@ class PointsFarmer:
     # Helpers
     # =========================================================================
 
-    def _get_usdc_balance(self, balances: Any) -> float:
-        """Extract USDC balance from balances response."""
-        if isinstance(balances, dict):
-            for asset, data in balances.items():
-                if asset in ("USDC", "USDT"):
-                    if isinstance(data, dict):
-                        return float(data.get("available", 0))
-                    return float(data)
+    def _get_usdc_balance(self, collateral: Any) -> float:
+        """Extract available equity from collateral response for perps trading."""
+        if isinstance(collateral, dict):
+            # For perps trading, use netEquityAvailable from collateral endpoint
+            net_equity_available = collateral.get("netEquityAvailable")
+            if net_equity_available is not None:
+                return float(net_equity_available)
+            # Fallback to netEquity if netEquityAvailable not present
+            net_equity = collateral.get("netEquity")
+            if net_equity is not None:
+                return float(net_equity)
         return 0.0
 
     def _round_quantity(self, symbol: str, quantity: float) -> float:
