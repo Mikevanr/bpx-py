@@ -1,15 +1,20 @@
 """
-Backpack Exchange Wick Fader (Mean Reversion)
+Backpack Exchange Grid Market Maker
 
-High-frequency mean reversion scalping bot for BTC, ETH, SOL perpetuals.
-Fades rapid price wicks expecting reversion to mean.
+Points farming bot with maker-only orders for minimal fees.
+Generates high volume while maintaining profitability.
 
 Strategy:
-- Detect rapid wicks from Binance (0.10% in 2 seconds)
-- FADE the wick: spike UP → SHORT, spike DOWN → LONG
-- Expect price to revert after sharp moves
-- TP/SL based on leveraged margin P/L (not asset price)
-- Use 50x leverage for volume, maker orders for lower fees
+- Place limit orders at best bid/ask (maker-only)
+- When filled, place take-profit order at entry ± profit target
+- All orders use post_only flag = guaranteed 0.01% maker fee (VIP1)
+- No directional bias - profit from spread capture
+- High frequency, small profits, consistent volume
+
+Fee Math (VIP1):
+- Maker: 0.010% per side = 0.020% round trip
+- Target profit: 0.030% per trade
+- Net profit: ~0.010% per trade after fees
 
 Usage:
     from bpx.points_farmer import PointsFarmer
@@ -55,42 +60,33 @@ BINANCE_TICKERS: Dict[str, str] = {
 BINANCE_TO_BACKPACK: Dict[str, str] = {v: k for k, v in BINANCE_TICKERS.items()}
 
 # =============================================================================
-# WICK FADING PARAMETERS (MEAN REVERSION)
+# GRID MARKET MAKER PARAMETERS
 # =============================================================================
-
-# Signal Detection - lower threshold to actually trigger trades
-MOMENTUM_THRESHOLD = 0.0003  # 0.03% move triggers entry (realistic for BTC/ETH/SOL)
-MOMENTUM_WINDOW = 5.0        # 5 second window
-MIN_VOLUME_RATIO = 0.5       # Low requirement - just need some activity
 
 # Position Sizing
 MAX_CONCURRENT_POSITIONS = 3  # One per symbol max
-LEVERAGE_USAGE = 0.8          # Use 80% of max leverage (safety margin)
-POSITION_SIZE_PCT = 0.30      # 30% of balance per position
+POSITION_SIZE_PCT = 0.25      # 25% of collateral per position
+LEVERAGE_USAGE = 0.8          # Use 80% of max leverage
 
-# Take Profit & Stop Loss (based on LEVERAGED P/L, not asset price)
-# These are returns on margin, e.g., 3% = 3% profit on your margin
-TP_PERCENT = 0.03       # 3% take profit on margin
-SL_PERCENT = 0.05       # 5% stop loss on margin
-TRAILING_STOP = True    # Enable trailing stop
-TRAILING_ACTIVATION = 0.015   # Activate trailing after 1.5% profit on margin
-TRAILING_DISTANCE = 0.02      # Trail 2% behind on margin
+# Profit Target (must cover fees + leave profit)
+# VIP1 fees: 0.01% maker per side = 0.02% round trip
+PROFIT_TARGET_PCT = 0.0003    # 0.03% profit target on notional
+MIN_SPREAD_PCT = 0.0002       # 0.02% minimum spread to enter (avoid tight spreads)
+
+# Order Management
+ORDER_REFRESH_SECONDS = 2.0   # Refresh unfilled orders every 2 seconds
+MAX_ORDER_AGE = 10.0          # Cancel orders older than 10 seconds
+MAX_POSITION_TIME = 120       # Force close after 2 minutes if TP not hit
 
 # Risk Management
-MAX_LOSS_USDC = 5.00           # Hard stop per position
-MAX_DAILY_LOSS = 50.00         # Stop trading if daily loss exceeds this
-COOLDOWN_SECONDS = 1           # Fast cooldown for more trades
-MAX_POSITION_TIME = 300        # Force close after 5 minutes (was 60s)
-
-# Order Execution
-USE_TAKER_ORDERS = False       # Prefer maker orders for lower fees
-MAX_SLIPPAGE = 0.001           # 0.1% max slippage allowed (was 0.03%)
+MAX_LOSS_PCT = 0.001          # 0.1% max loss per position (emergency exit)
+MAX_DAILY_LOSS = 25.00        # Stop trading if daily loss exceeds $25
+COOLDOWN_SECONDS = 0.5        # Short cooldown between order placements
 
 # Safety
-MAX_PRICE_DEVIATION = 0.005    # 0.5% max deviation Binance vs Backpack
-STALE_ORDER_TIMEOUT = 3        # Cancel unfilled limit orders after 3s
+MAX_PRICE_DEVIATION = 0.003   # 0.3% max deviation Binance vs Backpack
 
-# Binance WebSocket
+# Binance WebSocket (for reference prices)
 BINANCE_WS_URL = "wss://fstream.binance.com/stream"
 
 
@@ -212,13 +208,13 @@ class PointsFarmer:
         """Main entry point - runs the bot forever."""
         self._running = True
         print("=" * 60)
-        print("WICK FADER - BTC/ETH/SOL (MEAN REVERSION)")
+        print("GRID MARKET MAKER - BTC/ETH/SOL")
         print("=" * 60)
         print(f"Trading pairs: {list(LEVERAGE.keys())}")
-        print(f"Strategy: Spike UP → SHORT | Spike DOWN → LONG")
-        print(f"Wick threshold: {MOMENTUM_THRESHOLD * 100}% in {MOMENTUM_WINDOW}s")
-        print(f"TP: {TP_PERCENT * 100}% margin | SL: {SL_PERCENT * 100}% margin")
-        print(f"Order type: {'Taker' if USE_TAKER_ORDERS else 'Maker (lower fees)'}")
+        print(f"Strategy: Maker-only orders, capture spread + {PROFIT_TARGET_PCT*100:.2f}% profit")
+        print(f"Position size: {POSITION_SIZE_PCT*100}% of collateral")
+        print(f"Order refresh: {ORDER_REFRESH_SECONDS}s | Max age: {MAX_ORDER_AGE}s")
+        print(f"VIP1 fees: 0.01% maker | Target profit: {PROFIT_TARGET_PCT*100:.2f}%")
         print("=" * 60)
 
         try:
@@ -342,8 +338,8 @@ class PointsFarmer:
             if self.debug and self._msg_count <= 5:
                 print(f"[{symbol}] Price: {price}, Vol: {volume}")
 
-            # Check for momentum signal
-            await self._check_momentum(symbol, state)
+            # Check for grid entry opportunity
+            await self._check_grid_entry(symbol, state)
 
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             if self.debug:
@@ -369,12 +365,12 @@ class PointsFarmer:
                                 price = float(last_price)
                                 self._backpack_prices[symbol] = price
 
-                                # For tokens without Binance feed, use Backpack for wick detection
+                                # For tokens without Binance feed, use Backpack for grid entry
                                 if symbol not in BINANCE_TICKERS:
                                     state = self.states[symbol]
                                     state.prices.append(PricePoint(timestamp, price))
                                     self._last_prices[symbol] = price
-                                    await self._check_wick(symbol, state)
+                                    await self._check_grid_entry(symbol, state)
 
                 elif isinstance(tickers, dict):
                     for symbol, data in tickers.items():
@@ -384,12 +380,12 @@ class PointsFarmer:
                                 price = float(last_price)
                                 self._backpack_prices[symbol] = price
 
-                                # For tokens without Binance feed, use Backpack for wick detection
+                                # For tokens without Binance feed, use Backpack for grid entry
                                 if symbol not in BINANCE_TICKERS:
                                     state = self.states[symbol]
                                     state.prices.append(PricePoint(timestamp, price))
                                     self._last_prices[symbol] = price
-                                    await self._check_wick(symbol, state)
+                                    await self._check_grid_entry(symbol, state)
             except Exception as e:
                 if self.debug:
                     print(f"Backpack price fetch error: {e}")
@@ -428,42 +424,51 @@ class PointsFarmer:
             order_id = data.get("id")
             status = data.get("status")
             symbol = data.get("symbol")
-            side = data.get("side")
-            filled_qty = data.get("executedQuantity", "0")
-            price = data.get("price", "0")
+            order_side = data.get("side")
+            filled_qty = float(data.get("executedQuantity", "0") or 0)
+            price = float(data.get("price", "0") or 0)
 
             if self.debug:
-                print(f"[WS ORDER] {symbol} {status}: {side} {filled_qty} @ {price}")
+                print(f"[WS ORDER] {symbol} {status}: {order_side} {filled_qty} @ {price}")
+
+            state = self.states.get(symbol)
+            if not state:
+                return
 
             if status == "Filled":
-                state = self.states.get(symbol)
-                if state and state.pending_entry_order_id == order_id:
-                    # Entry order filled
-                    print(f"*** ENTRY FILLED {symbol} {side} {filled_qty} @ {price} ***")
-                    state.pending_entry_order_id = None
-                    if state.position:
-                        state.position.entry_time = time.time()
-                        state.position.entry_price = float(price) if price else state.position.entry_price
-                        # TP/SL is now handled by position monitor based on margin P/L %
-                        print(f"    TP: {TP_PERCENT*100:.1f}% margin | SL: {SL_PERCENT*100:.1f}% margin")
+                # Check if this is a pending entry order
+                if state.pending_entry_order_id == order_id:
+                    # Entry order filled - create position and place TP
+                    pending_info = self._pending_fills.get(order_id, {})
+                    side = pending_info.get("side", Side.LONG if order_side == "Bid" else Side.SHORT)
+                    margin = pending_info.get("margin", 0)
+                    leverage = pending_info.get("leverage", LEVERAGE.get(symbol, 50))
+                    quantity = filled_qty if filled_qty > 0 else pending_info.get("quantity", 0)
+                    fill_price = price if price > 0 else pending_info.get("price", 0)
+
+                    await self._on_entry_filled(symbol, side, fill_price, quantity, order_id, margin, leverage)
+
+                    # Clean up pending fill info
+                    if order_id in self._pending_fills:
+                        del self._pending_fills[order_id]
+
+                # Check if this is a TP order
+                elif state.position and state.position.tp_order_id == order_id:
+                    # TP filled - handled by position monitor, but log it
+                    print(f"[WS] TP FILLED {symbol} @ {price}")
 
             elif status == "Cancelled":
-                state = self.states.get(symbol)
-                if state:
-                    if state.pending_entry_order_id == order_id:
-                        state.pending_entry_order_id = None
-                        state.pending_entry_time = None
-                        state.position = None
-                        if self.debug:
-                            print(f"[{symbol}] Entry order cancelled")
-                    elif state.position and state.position.tp_order_id == order_id:
-                        state.position.tp_order_id = None
-                        if self.debug:
-                            print(f"[{symbol}] TP order cancelled")
-                    elif state.position and state.position.sl_order_id == order_id:
-                        state.position.sl_order_id = None
-                        if self.debug:
-                            print(f"[{symbol}] SL order cancelled")
+                if state.pending_entry_order_id == order_id:
+                    state.pending_entry_order_id = None
+                    state.pending_entry_time = None
+                    if order_id in self._pending_fills:
+                        del self._pending_fills[order_id]
+                    if self.debug:
+                        print(f"[{symbol}] Entry order cancelled")
+                elif state.position and state.position.tp_order_id == order_id:
+                    state.position.tp_order_id = None
+                    if self.debug:
+                        print(f"[{symbol}] TP order cancelled")
 
         except Exception as e:
             if self.debug:
@@ -591,8 +596,8 @@ class PointsFarmer:
         state.position = None
         state.pending_entry_order_id = None
 
-    async def _check_momentum(self, symbol: str, state: SymbolState) -> None:
-        """Check for momentum signal - FOLLOW the trend."""
+    async def _check_grid_entry(self, symbol: str, state: SymbolState) -> None:
+        """Grid market maker - place maker orders to capture spread."""
         # Skip if paused or already in position
         if state.paused:
             return
@@ -612,187 +617,214 @@ class PointsFarmer:
 
         # Check for pending entry order
         if state.pending_entry_order_id:
+            # Check if order is too old
+            if state.pending_entry_time and time.time() - state.pending_entry_time > MAX_ORDER_AGE:
+                # Cancel stale order
+                try:
+                    await self.account.cancel_order(symbol=symbol, order_id=state.pending_entry_order_id)
+                    print(f"[{symbol}] Cancelled stale entry order")
+                except Exception:
+                    pass
+                state.pending_entry_order_id = None
+                state.pending_entry_time = None
             return
 
-        now = time.time()
-        prices = state.prices
+        # Get orderbook for spread analysis
+        try:
+            depth = await self.public.get_depth(symbol)
+            bids = depth.get("bids", [])
+            asks = depth.get("asks", [])
 
-        # Get prices within the momentum window
-        window_prices = [
-            p for p in prices if now - p.timestamp <= MOMENTUM_WINDOW
-        ]
-
-        if len(window_prices) < 3:  # Need enough data points (reduced from 5)
-            return
-
-        # Calculate momentum (price change over window)
-        oldest_price = window_prices[0].price
-        newest_price = window_prices[-1].price
-        momentum = (newest_price - oldest_price) / oldest_price
-
-        # Check if momentum exceeds threshold
-        if abs(momentum) < MOMENTUM_THRESHOLD:
-            return
-
-        # Volume confirmation - check if recent volume is above average
-        if len(state.volumes) >= 5:  # Reduced from 10
-            avg_volume = sum(state.volumes) / len(state.volumes)
-            recent_volume = sum(p.volume for p in window_prices[-5:])
-            volume_ratio = recent_volume / (avg_volume * 5) if avg_volume > 0 else 1.0
-
-            if volume_ratio < MIN_VOLUME_RATIO:
-                # Low volume move - skip (likely noise)
+            if not bids or not asks:
                 return
 
+            best_bid = float(bids[0][0])
+            best_ask = float(asks[0][0])
+            mid_price = (best_bid + best_ask) / 2
+            spread = (best_ask - best_bid) / mid_price
+
+        except Exception as e:
+            if self.debug:
+                print(f"[{symbol}] Orderbook error: {e}")
+            return
+
+        # Check if spread is wide enough to be profitable
+        if spread < MIN_SPREAD_PCT:
+            return  # Spread too tight, skip
+
+        # Alternate between long and short based on total trades (for balance)
+        # Or bias based on recent price action
+        go_long = (self.stats.total_trades % 2 == 0)
+
         self.stats.signals_detected += 1
-        direction = "UP" if momentum > 0 else "DOWN"
-        print(f"[{symbol}] WICK {direction}: {momentum*100:.3f}% - FADING (mean reversion)", flush=True)
+        side = Side.LONG if go_long else Side.SHORT
 
-        # WICK FADING (MEAN REVERSION): Trade AGAINST the spike
-        if momentum > 0:
-            # Price spiked UP -> go SHORT (expect pullback)
-            await self._enter_position(symbol, Side.SHORT)
-        else:
-            # Price dumped DOWN -> go LONG (expect bounce)
-            await self._enter_position(symbol, Side.LONG)
+        # Enter with maker order
+        await self._enter_position_maker(symbol, side, best_bid, best_ask, mid_price)
 
     # =========================================================================
-    # Trade Execution
+    # Trade Execution (Grid Market Maker)
     # =========================================================================
 
-    async def _enter_position(self, symbol: str, side: Side) -> None:
-        """Enter position with market order for immediate fill."""
+    async def _enter_position_maker(
+        self, symbol: str, side: Side, best_bid: float, best_ask: float, mid_price: float
+    ) -> None:
+        """Enter position with maker-only limit order."""
         state = self.states[symbol]
         side_str = "Long" if side == Side.LONG else "Short"
-        print(f"[{symbol}] _enter_position called: {side_str}", flush=True)
 
         # Check max concurrent positions limit
         current_positions = sum(1 for s in self.states.values() if s.position is not None)
         if current_positions >= MAX_CONCURRENT_POSITIONS:
-            print(f"[{symbol}] BLOCKED: Max {MAX_CONCURRENT_POSITIONS} positions reached")
             return
 
-        # Set cooldown immediately
-        state.last_trade_time = time.time()
-
         try:
-            # Get reference price from Binance
-            reference_price = self._last_prices.get(symbol)
-            if not reference_price:
-                print(f"[{symbol}] BLOCKED: No Binance price", flush=True)
-                return
-
-            # Get Backpack orderbook for execution price
-            try:
-                depth = await self.public.get_depth(symbol)
-                bids = depth.get("bids", [])
-                asks = depth.get("asks", [])
-
-                if not bids or not asks:
-                    print(f"[{symbol}] Empty orderbook")
-                    return
-
-                best_bid = float(bids[0][0])
-                best_ask = float(asks[0][0])
-                spread_pct = (best_ask - best_bid) / best_bid * 100
-
-                # Check slippage vs Binance price
-                if side == Side.LONG:
-                    slippage = (best_ask - reference_price) / reference_price
-                else:
-                    slippage = (reference_price - best_bid) / reference_price
-
-                if slippage > MAX_SLIPPAGE:
-                    print(f"[{symbol}] Slippage too high: {slippage*100:.3f}%")
-                    return
-
-            except Exception as e:
-                print(f"[{symbol}] Orderbook error: {e}")
-                return
-
-            # Calculate position size: POSITION_SIZE_PCT of balance * leverage
+            # Get collateral for position sizing
             collateral = await self.account.get_collateral()
             usdc_balance = self._get_usdc_balance(collateral)
+
+            if usdc_balance <= 0:
+                print(f"[{symbol}] No collateral available")
+                return
 
             leverage = LEVERAGE[symbol]
             effective_leverage = leverage * LEVERAGE_USAGE
             margin = usdc_balance * POSITION_SIZE_PCT
             notional = margin * effective_leverage
-            entry_price = best_ask if side == Side.LONG else best_bid
-            quantity = notional / entry_price
 
-            # Round quantity
+            # Set entry price at best bid (for long) or best ask (for short)
+            # This ensures we're providing liquidity, not taking it
+            if side == Side.LONG:
+                entry_price = best_bid  # Buy at bid = maker
+                order_side = "Bid"
+            else:
+                entry_price = best_ask  # Sell at ask = maker
+                order_side = "Ask"
+
+            quantity = notional / entry_price
             quantity = self._round_quantity(symbol, quantity)
+            entry_price = self._round_price(symbol, entry_price)
 
             if quantity <= 0:
-                print(f"[{symbol}] Quantity too small")
                 return
 
-            order_side = "Bid" if side == Side.LONG else "Ask"
+            print(f"[{symbol}] MAKER {side_str} {quantity} @ ${entry_price:.2f} (${notional:.0f} notional)")
 
-            # Use limit order for maker fees, or market order for immediate fill
-            if USE_TAKER_ORDERS:
-                print(f"[{symbol}] MARKET {side_str} {quantity} @ ~${entry_price:.2f} (${notional:.0f} notional, {effective_leverage:.0f}x)")
-                result = await self.account.execute_order(
-                    symbol=symbol,
-                    side=order_side,
-                    order_type="Market",
-                    quantity=str(quantity),
-                )
-            else:
-                # Use limit order at current price for maker fees
-                limit_price = self._round_price(symbol, entry_price)
-                print(f"[{symbol}] LIMIT {side_str} {quantity} @ ${limit_price:.2f} (${notional:.0f} notional, {effective_leverage:.0f}x)")
-                result = await self.account.execute_order(
-                    symbol=symbol,
-                    side=order_side,
-                    order_type="Limit",
-                    quantity=str(quantity),
-                    price=str(limit_price),
-                    time_in_force="IOC",  # Immediate-or-cancel to avoid hanging orders
-                )
+            # Place limit order with post_only to guarantee maker
+            result = await self.account.execute_order(
+                symbol=symbol,
+                side=order_side,
+                order_type="Limit",
+                quantity=str(quantity),
+                price=str(entry_price),
+                post_only=True,  # CRITICAL: Ensures maker-only, rejects if would be taker
+            )
 
             if isinstance(result, dict) and result.get("id"):
                 order_id = result["id"]
                 order_status = result.get("status", "")
-                executed_qty = float(result.get("executedQuantity", 0) or 0)
 
-                if order_status == "Filled" or executed_qty > 0:
-                    fill_price = float(result.get("avgPrice") or result.get("price") or entry_price)
-                    actual_qty = executed_qty if executed_qty > 0 else quantity
-                    actual_notional = fill_price * actual_qty
-                    actual_margin = actual_notional / effective_leverage
-
-                    # Create position with margin tracking for leveraged P/L
-                    state.position = Position(
-                        symbol=symbol,
-                        side=side,
-                        entry_price=fill_price,
-                        quantity=actual_qty,
-                        entry_time=time.time(),
-                        order_id=order_id,
-                        notional=actual_notional,
-                        margin=actual_margin,
-                        leverage=effective_leverage,
-                        highest_price=fill_price,
-                        lowest_price=fill_price,
-                    )
-
-                    print(f"*** FILLED {symbol} {side_str} {actual_qty:.6f} @ ${fill_price:.2f} ***")
-                    print(f"    Notional: ${actual_notional:.0f} | Margin: ${actual_margin:.2f} | Leverage: {effective_leverage:.0f}x")
-
-                    # Update stats
-                    self.stats.total_volume += notional
-                    self.stats.total_points += notional
-
+                if order_status == "Filled":
+                    # Immediately filled (rare for maker order)
+                    fill_price = float(result.get("price") or entry_price)
+                    await self._on_entry_filled(symbol, side, fill_price, quantity, order_id, margin, effective_leverage)
                 else:
-                    print(f"[{symbol}] Order failed: {order_status}")
+                    # Order is open, waiting for fill
+                    state.pending_entry_order_id = order_id
+                    state.pending_entry_time = time.time()
+                    # Store order info for when it fills
+                    self._pending_fills[order_id] = {
+                        "symbol": symbol,
+                        "side": side,
+                        "quantity": quantity,
+                        "price": entry_price,
+                        "margin": margin,
+                        "leverage": effective_leverage,
+                    }
             else:
-                error_msg = result.get('message', result) if isinstance(result, dict) else result
-                print(f"[{symbol}] Order rejected: {error_msg}")
+                error_msg = result.get("message", str(result)) if isinstance(result, dict) else str(result)
+                if "post-only" in error_msg.lower() or "would immediately match" in error_msg.lower():
+                    # Post-only rejected - price moved, try again next cycle
+                    pass
+                else:
+                    print(f"[{symbol}] Order error: {error_msg}")
 
         except Exception as e:
-            print(f"Entry error {symbol}: {e}")
+            print(f"[{symbol}] Entry error: {e}")
+
+    async def _on_entry_filled(
+        self, symbol: str, side: Side, fill_price: float, quantity: float,
+        order_id: str, margin: float, leverage: float
+    ) -> None:
+        """Handle entry order fill - create position and place TP order."""
+        state = self.states[symbol]
+        state.pending_entry_order_id = None
+        state.pending_entry_time = None
+        state.last_trade_time = time.time()
+
+        notional = fill_price * quantity
+        side_str = "LONG" if side == Side.LONG else "SHORT"
+        print(f"[{symbol}] FILLED {side_str} @ ${fill_price:.2f}")
+
+        # Calculate TP price based on profit target
+        if side == Side.LONG:
+            tp_price = fill_price * (1 + PROFIT_TARGET_PCT)
+        else:
+            tp_price = fill_price * (1 - PROFIT_TARGET_PCT)
+
+        tp_price = self._round_price(symbol, tp_price)
+
+        # Create position
+        state.position = Position(
+            symbol=symbol,
+            side=side,
+            entry_price=fill_price,
+            quantity=quantity,
+            entry_time=time.time(),
+            order_id=order_id,
+            tp_price=tp_price,
+            notional=notional,
+            margin=margin,
+            leverage=leverage,
+        )
+
+        # Place TP order (maker-only)
+        await self._place_tp_order_maker(symbol, state.position)
+
+        self.stats.total_trades += 1
+        self.stats.total_volume += notional
+
+    async def _place_tp_order_maker(self, symbol: str, position: Position) -> None:
+        """Place take-profit order with post_only for maker fees."""
+        try:
+            close_side = "Ask" if position.side == Side.LONG else "Bid"
+            tp_price = self._round_price(symbol, position.tp_price)
+
+            result = await self.account.execute_order(
+                symbol=symbol,
+                side=close_side,
+                order_type="Limit",
+                quantity=str(position.quantity),
+                price=str(tp_price),
+                post_only=True,
+                reduce_only=True,
+            )
+
+            if isinstance(result, dict) and result.get("id"):
+                position.tp_order_id = result["id"]
+                print(f"[{symbol}] TP order placed @ ${tp_price:.2f} (maker-only)")
+            else:
+                error_msg = result.get("message", str(result)) if isinstance(result, dict) else str(result)
+                print(f"[{symbol}] TP order failed: {error_msg}")
+
+        except Exception as e:
+            print(f"[{symbol}] TP order error: {e}")
+
+    async def _enter_position(self, symbol: str, side: Side) -> None:
+        """Legacy entry function - not used in grid market maker mode."""
+        # This function is kept for compatibility but not used
+        # Grid market maker uses _enter_position_maker directly
+        pass
 
     async def _place_tp_order(self, symbol: str, position: Position) -> None:
         """Place take-profit maker-only limit order for 50% fee discount."""
@@ -1061,7 +1093,7 @@ class PointsFarmer:
     # =========================================================================
 
     async def _position_monitor_loop(self) -> None:
-        """Monitor positions with trailing stops."""
+        """Monitor positions for grid market maker - check TP fills and emergency exits."""
         print("[MONITOR] Position monitor started", flush=True)
         last_sync = 0
 
@@ -1083,78 +1115,88 @@ class PointsFarmer:
                     if not current_price:
                         continue
 
-                    # Calculate profit/loss in USDC and as % of margin (leveraged P/L)
+                    # Calculate P/L
                     if position.side == Side.LONG:
                         unrealized_pnl = (current_price - position.entry_price) * position.quantity
-                        # Update highest price for trailing stop
-                        if current_price > position.highest_price:
-                            position.highest_price = current_price
+                        pnl_pct = (current_price - position.entry_price) / position.entry_price
                     else:
                         unrealized_pnl = (position.entry_price - current_price) * position.quantity
-                        # Update lowest price for trailing stop
-                        if current_price < position.lowest_price:
-                            position.lowest_price = current_price
-
-                    # Calculate margin P/L % (leveraged return on margin)
-                    margin_pnl_pct = unrealized_pnl / position.margin if position.margin > 0 else 0
-
-                    # Track highest/lowest margin P/L for trailing stop
-                    if margin_pnl_pct > position.highest_margin_pnl_pct:
-                        position.highest_margin_pnl_pct = margin_pnl_pct
-                    if margin_pnl_pct < position.lowest_margin_pnl_pct:
-                        position.lowest_margin_pnl_pct = margin_pnl_pct
+                        pnl_pct = (position.entry_price - current_price) / position.entry_price
 
                     time_held = now - position.entry_time
 
-                    # ========== TAKE PROFIT (based on margin P/L %) ==========
-                    if margin_pnl_pct >= TP_PERCENT:
-                        await self._close_position(symbol, position, "TP", unrealized_pnl)
+                    # ========== TP ORDER FILLED CHECK ==========
+                    # The TP is a limit order - check if it's been filled by checking order status
+                    if position.tp_order_id:
+                        try:
+                            orders = await self.account.get_open_orders(symbol=symbol)
+                            tp_still_open = any(o.get("id") == position.tp_order_id for o in orders) if isinstance(orders, list) else False
+                            if not tp_still_open:
+                                # TP order was filled!
+                                await self._on_tp_filled(symbol, position, unrealized_pnl)
+                                continue
+                        except Exception:
+                            pass
+
+                    # ========== EMERGENCY EXIT: MAX LOSS ==========
+                    if pnl_pct <= -MAX_LOSS_PCT:
+                        await self._close_position_emergency(symbol, position, "MAX_LOSS", unrealized_pnl)
                         continue
 
-                    # ========== TRAILING STOP (based on margin P/L %) ==========
-                    if TRAILING_STOP and margin_pnl_pct >= TRAILING_ACTIVATION:
-                        if not position.trailing_active:
-                            position.trailing_active = True
-                            print(f"[{symbol}] Trailing stop ACTIVATED at {margin_pnl_pct*100:.2f}% margin P/L")
-
-                        # Check if we've dropped TRAILING_DISTANCE below the peak
-                        trailing_trigger = position.highest_margin_pnl_pct - TRAILING_DISTANCE
-                        if margin_pnl_pct <= trailing_trigger:
-                            await self._close_position(symbol, position, "TRAIL", unrealized_pnl)
-                            continue
-
-                    # ========== STOP LOSS (based on margin P/L %) ==========
-                    if margin_pnl_pct <= -SL_PERCENT:
-                        await self._close_position(symbol, position, "SL", unrealized_pnl)
-                        continue
-
-                    # ========== MAX LOSS (USDC) ==========
-                    if unrealized_pnl <= -MAX_LOSS_USDC:
-                        await self._close_position(symbol, position, "MAX_LOSS", unrealized_pnl)
-                        continue
-
-                    # ========== MAX TIME ==========
+                    # ========== EMERGENCY EXIT: TIMEOUT ==========
                     if time_held >= MAX_POSITION_TIME:
-                        await self._close_position(symbol, position, "TIMEOUT", unrealized_pnl)
+                        await self._close_position_emergency(symbol, position, "TIMEOUT", unrealized_pnl)
                         continue
 
-                    # Log status every 10 seconds
-                    if int(time_held) % 10 == 0 and int(time_held) > 0:
+                    # Log status every 15 seconds
+                    if int(time_held) % 15 == 0 and int(time_held) > 0:
                         side_str = "L" if position.side == Side.LONG else "S"
-                        trail_str = f" TRAIL@{position.highest_margin_pnl_pct*100:.1f}%" if position.trailing_active else ""
-                        print(f"[{symbol}] {side_str} {margin_pnl_pct*100:+.2f}% margin | ${unrealized_pnl:+.2f} | {time_held:.0f}s{trail_str}")
+                        tp_target = PROFIT_TARGET_PCT * 100
+                        print(f"[{symbol}] {side_str} {pnl_pct*100:+.3f}% (TP={tp_target:.2f}%) | ${unrealized_pnl:+.2f} | {time_held:.0f}s")
 
             except Exception as e:
-                # Always log monitor errors - this is critical for SL execution
                 print(f"Monitor error: {e}")
 
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.2)  # Check every 200ms
 
-    async def _close_position(self, symbol: str, position: Position, reason: str, pnl: float) -> None:
-        """Close position with market order and update stats."""
+    async def _on_tp_filled(self, symbol: str, position: Position, expected_pnl: float) -> None:
+        """Handle TP order fill - update stats (maker fees already paid)."""
+        state = self.states[symbol]
+
+        # Calculate actual PnL based on TP price
+        if position.side == Side.LONG:
+            actual_pnl = (position.tp_price - position.entry_price) * position.quantity
+        else:
+            actual_pnl = (position.entry_price - position.tp_price) * position.quantity
+
+        # Update stats
+        self.stats.total_pnl += actual_pnl
+        self.stats.daily_pnl += actual_pnl
+        self.stats.total_volume += position.notional  # Exit volume
+        self.stats.wins += 1
+        state.cumulative_pnl += actual_pnl
+
+        # Log the TP
+        side_str = "LONG" if position.side == Side.LONG else "SHORT"
+        win_rate = self.stats.wins / self.stats.total_trades * 100 if self.stats.total_trades > 0 else 0
+
+        print(f"TP HIT {symbol} {side_str} | Entry=${position.entry_price:.2f} TP=${position.tp_price:.2f} | +${actual_pnl:.2f} | W/L: {self.stats.wins}/{self.stats.losses} ({win_rate:.0f}%) [MAKER]")
+
+        # Clear position
+        state.position = None
+
+    async def _close_position_emergency(self, symbol: str, position: Position, reason: str, pnl: float) -> None:
+        """Emergency close with market order (pays taker fee)."""
         state = self.states[symbol]
 
         try:
+            # Cancel TP order first
+            if position.tp_order_id:
+                try:
+                    await self.account.cancel_order(symbol=symbol, order_id=position.tp_order_id)
+                except Exception:
+                    pass
+
             close_side = "Ask" if position.side == Side.LONG else "Bid"
 
             result = await self.account.execute_order(
@@ -1176,20 +1218,11 @@ class PointsFarmer:
             else:
                 actual_pnl = (position.entry_price - close_price) * position.quantity
 
-            volume = position.notional * 2  # Entry + exit
-
             # Update stats
             self.stats.total_pnl += actual_pnl
             self.stats.daily_pnl += actual_pnl
-            self.stats.total_volume += position.notional  # Exit volume
-            self.stats.total_points += position.notional
-            self.stats.total_trades += 1
-
-            if actual_pnl >= 0:
-                self.stats.wins += 1
-            else:
-                self.stats.losses += 1
-
+            self.stats.total_volume += position.notional
+            self.stats.losses += 1
             state.cumulative_pnl += actual_pnl
 
             # Log the close
@@ -1197,13 +1230,13 @@ class PointsFarmer:
             pnl_str = f"+${actual_pnl:.2f}" if actual_pnl >= 0 else f"-${abs(actual_pnl):.2f}"
             win_rate = self.stats.wins / self.stats.total_trades * 100 if self.stats.total_trades > 0 else 0
 
-            print(f"CLOSE {symbol} [{reason}] {side_str} | Entry=${position.entry_price:.2f} Exit=${close_price:.2f} | {pnl_str} | W/L: {self.stats.wins}/{self.stats.losses} ({win_rate:.0f}%)")
+            print(f"EMERGENCY {symbol} [{reason}] {side_str} | Entry=${position.entry_price:.2f} Exit=${close_price:.2f} | {pnl_str} | W/L: {self.stats.wins}/{self.stats.losses} ({win_rate:.0f}%) [TAKER]")
 
             # Clear position
             state.position = None
 
         except Exception as e:
-            print(f"Close error {symbol}: {e}")
+            print(f"Emergency close error {symbol}: {e}")
 
     async def _sync_positions(self) -> None:
         """Sync local state with actual positions on Backpack."""
@@ -1259,8 +1292,8 @@ class PointsFarmer:
                             state.position.entry_price = actual_entry
                             state.position.quantity = abs(actual_size)
                             state.position.entry_time = time.time()
-                            # TP/SL is handled by position monitor based on margin P/L %
-                            print(f"    TP: {TP_PERCENT*100:.1f}% margin | SL: {SL_PERCENT*100:.1f}% margin")
+                            # TP is a limit order at entry +/- PROFIT_TARGET_PCT
+                            print(f"    TP target: {PROFIT_TARGET_PCT*100:.2f}% | Emergency exit: {MAX_LOSS_PCT*100:.2f}%")
                     else:
                         # No pending entry - check if position is still open
                         if abs(actual_size) < 0.00001:
@@ -1397,7 +1430,7 @@ class PointsFarmer:
             side_str = "Long" if side == Side.LONG else "Short"
             print(f"*** ADOPTED POSITION: {symbol} {side_str} {quantity:.6f} @ {entry_price:.2f} ***")
             print(f"    Notional: ${notional_value:.2f} | Margin: ${margin:.2f} | Leverage: {leverage:.0f}x")
-            print(f"    TP: {TP_PERCENT*100:.1f}% margin | SL: {SL_PERCENT*100:.1f}% margin")
+            print(f"    TP target: {PROFIT_TARGET_PCT*100:.2f}% | Emergency exit: {MAX_LOSS_PCT*100:.2f}%")
 
         except Exception as e:
             print(f"Error adopting position {symbol}: {e}")
