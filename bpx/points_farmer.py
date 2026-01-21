@@ -1,15 +1,15 @@
 """
-Backpack Exchange Momentum Scalper
+Backpack Exchange Wick Fader (Mean Reversion)
 
-High-frequency momentum scalping bot for BTC, ETH, SOL perpetuals.
-Follows short-term momentum with tight risk management.
+High-frequency mean reversion scalping bot for BTC, ETH, SOL perpetuals.
+Fades rapid price wicks expecting reversion to mean.
 
 Strategy:
-- Detect momentum moves from Binance (0.08% in 3 seconds)
-- Enter WITH the momentum (not against it)
-- Tight TP (0.06%) and SL (0.10%) for quick trades
-- Use 50x leverage for maximum volume generation
-- Immediate taker entries for guaranteed fills
+- Detect rapid wicks from Binance (0.10% in 2 seconds)
+- FADE the wick: spike UP → SHORT, spike DOWN → LONG
+- Expect price to revert after sharp moves
+- TP/SL based on leveraged margin P/L (not asset price)
+- Use 50x leverage for volume, maker orders for lower fees
 
 Usage:
     from bpx.points_farmer import PointsFarmer
@@ -55,13 +55,13 @@ BINANCE_TICKERS: Dict[str, str] = {
 BINANCE_TO_BACKPACK: Dict[str, str] = {v: k for k, v in BINANCE_TICKERS.items()}
 
 # =============================================================================
-# MOMENTUM SCALPING PARAMETERS
+# WICK FADING PARAMETERS (MEAN REVERSION)
 # =============================================================================
 
-# Signal Detection (tuned for more frequent trades)
-MOMENTUM_THRESHOLD = 0.0003  # 0.03% move triggers entry (was 0.08%)
-MOMENTUM_WINDOW = 5.0        # Seconds to measure momentum (was 3s)
-MIN_VOLUME_RATIO = 0.8       # Volume must be 0.8x average (was 1.5x - too strict)
+# Signal Detection - WICK FADING (need bigger moves to fade)
+MOMENTUM_THRESHOLD = 0.0010  # 0.10% spike triggers fade entry
+MOMENTUM_WINDOW = 2.0        # Seconds - wicks are fast, catch them quickly
+MIN_VOLUME_RATIO = 1.0       # At least average volume confirms real move
 
 # Position Sizing
 MAX_CONCURRENT_POSITIONS = 3  # One per symbol max
@@ -212,14 +212,13 @@ class PointsFarmer:
         """Main entry point - runs the bot forever."""
         self._running = True
         print("=" * 60)
-        print("MOMENTUM SCALPER - BTC/ETH/SOL")
+        print("WICK FADER - BTC/ETH/SOL (MEAN REVERSION)")
         print("=" * 60)
         print(f"Trading pairs: {list(LEVERAGE.keys())}")
-        print(f"Leverage: 50x | Order type: {'Taker' if USE_TAKER_ORDERS else 'Maker (lower fees)'}")
-        print(f"Momentum threshold: {MOMENTUM_THRESHOLD * 100}% in {MOMENTUM_WINDOW}s")
-        print(f"TP: {TP_PERCENT * 100}% margin | SL: {SL_PERCENT * 100}% margin (leveraged P/L)")
-        print(f"Trailing: {TRAILING_ACTIVATION * 100}% activate, {TRAILING_DISTANCE * 100}% trail (margin %)")
-        print(f"Position size: {POSITION_SIZE_PCT * 100}% of balance | Leverage usage: {LEVERAGE_USAGE * 100}%")
+        print(f"Strategy: Spike UP → SHORT | Spike DOWN → LONG")
+        print(f"Wick threshold: {MOMENTUM_THRESHOLD * 100}% in {MOMENTUM_WINDOW}s")
+        print(f"TP: {TP_PERCENT * 100}% margin | SL: {SL_PERCENT * 100}% margin")
+        print(f"Order type: {'Taker' if USE_TAKER_ORDERS else 'Maker (lower fees)'}")
         print("=" * 60)
 
         try:
@@ -647,15 +646,15 @@ class PointsFarmer:
 
         self.stats.signals_detected += 1
         direction = "UP" if momentum > 0 else "DOWN"
-        print(f"[{symbol}] MOMENTUM {direction}: {momentum*100:.3f}% - FOLLOWING", flush=True)
+        print(f"[{symbol}] WICK {direction}: {momentum*100:.3f}% - FADING (mean reversion)", flush=True)
 
-        # MOMENTUM FOLLOWING: Trade WITH the trend
+        # WICK FADING (MEAN REVERSION): Trade AGAINST the spike
         if momentum > 0:
-            # Price moving UP -> go LONG (ride the wave)
-            await self._enter_position(symbol, Side.LONG)
-        else:
-            # Price moving DOWN -> go SHORT (ride the wave)
+            # Price spiked UP -> go SHORT (expect pullback)
             await self._enter_position(symbol, Side.SHORT)
+        else:
+            # Price dumped DOWN -> go LONG (expect bounce)
+            await self._enter_position(symbol, Side.LONG)
 
     # =========================================================================
     # Trade Execution
