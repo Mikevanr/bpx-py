@@ -629,6 +629,11 @@ class PointsFarmer:
                 state.pending_entry_time = None
             return
 
+        # Get Binance reference price first
+        reference_price = self._last_prices.get(symbol)
+        if not reference_price:
+            return  # No reference price, skip
+
         # Get orderbook for spread analysis
         try:
             depth = await self.public.get_depth(symbol)
@@ -642,6 +647,13 @@ class PointsFarmer:
             best_ask = float(asks[0][0])
             mid_price = (best_bid + best_ask) / 2
             spread = (best_ask - best_bid) / mid_price
+
+            # CRITICAL: Validate orderbook price against Binance reference
+            price_deviation = abs(mid_price - reference_price) / reference_price
+            if price_deviation > MAX_PRICE_DEVIATION:
+                if self.debug:
+                    print(f"[{symbol}] Orderbook stale: BP={mid_price:.2f} vs Binance={reference_price:.2f} ({price_deviation*100:.2f}% off)")
+                return
 
         except Exception as e:
             if self.debug:
@@ -1515,8 +1527,8 @@ class PointsFarmer:
                 if c is None:
                     return "n/a"
                 color_prefix = ""
-                if abs(c) >= MOMENTUM_THRESHOLD:
-                    color_prefix = "**"  # Highlight momentum signal
+                if abs(c) >= PROFIT_TARGET_PCT:
+                    color_prefix = "**"  # Highlight significant move
                 return f"{color_prefix}{c*100:+.3f}%"
 
             short_symbol = symbol.replace("_USDC_PERP", "").replace("_USDT_PERP", "").replace("_USD_PERP", "")
