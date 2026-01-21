@@ -58,10 +58,10 @@ BINANCE_TO_BACKPACK: Dict[str, str] = {v: k for k, v in BINANCE_TICKERS.items()}
 # WICK FADING PARAMETERS (MEAN REVERSION)
 # =============================================================================
 
-# Signal Detection - WICK FADING (need bigger moves to fade)
-MOMENTUM_THRESHOLD = 0.0010  # 0.10% spike triggers fade entry
-MOMENTUM_WINDOW = 2.0        # Seconds - wicks are fast, catch them quickly
-MIN_VOLUME_RATIO = 1.0       # At least average volume confirms real move
+# Signal Detection - lower threshold to actually trigger trades
+MOMENTUM_THRESHOLD = 0.0003  # 0.03% move triggers entry (realistic for BTC/ETH/SOL)
+MOMENTUM_WINDOW = 5.0        # 5 second window
+MIN_VOLUME_RATIO = 0.5       # Low requirement - just need some activity
 
 # Position Sizing
 MAX_CONCURRENT_POSITIONS = 3  # One per symbol max
