@@ -597,7 +597,7 @@ class PointsFarmer:
         state.pending_entry_order_id = None
 
     async def _check_grid_entry(self, symbol: str, state: SymbolState) -> None:
-        """Grid market maker - place maker orders to capture spread."""
+        """Grid market maker - place maker orders using ticker prices (orderbook is broken)."""
         # Skip if paused or already in position
         if state.paused:
             return
@@ -629,50 +629,32 @@ class PointsFarmer:
                 state.pending_entry_time = None
             return
 
-        # Get Binance reference price first
-        reference_price = self._last_prices.get(symbol)
-        if not reference_price:
-            return  # No reference price, skip
-
-        # Get orderbook for spread analysis
-        try:
-            depth = await self.public.get_depth(symbol)
-            bids = depth.get("bids", [])
-            asks = depth.get("asks", [])
-
-            if not bids or not asks:
-                return
-
-            best_bid = float(bids[0][0])
-            best_ask = float(asks[0][0])
-            mid_price = (best_bid + best_ask) / 2
-            spread = (best_ask - best_bid) / mid_price
-
-            # CRITICAL: Validate orderbook price against Binance reference
-            price_deviation = abs(mid_price - reference_price) / reference_price
-            if price_deviation > MAX_PRICE_DEVIATION:
-                if self.debug:
-                    print(f"[{symbol}] Orderbook stale: BP={mid_price:.2f} vs Binance={reference_price:.2f} ({price_deviation*100:.2f}% off)")
-                return
-
-        except Exception as e:
-            if self.debug:
-                print(f"[{symbol}] Orderbook error: {e}")
+        # Get Binance reference price
+        binance_price = self._last_prices.get(symbol)
+        if not binance_price:
             return
 
-        # Check if spread is wide enough to be profitable
-        if spread < MIN_SPREAD_PCT:
-            return  # Spread too tight, skip
+        # Get Backpack ticker price (reliable, unlike orderbook which returns stale data)
+        backpack_price = self._backpack_prices.get(symbol)
+        if not backpack_price:
+            return
 
-        # Alternate between long and short based on total trades (for balance)
-        # Or bias based on recent price action
+        # Validate prices are in sync (< 0.3% difference)
+        price_diff = abs(backpack_price - binance_price) / binance_price
+        if price_diff > MAX_PRICE_DEVIATION:
+            return
+
+        # Use Backpack ticker as our reference price
+        current_price = backpack_price
+
+        # Alternate between long and short for balance
         go_long = (self.stats.total_trades % 2 == 0)
-
-        self.stats.signals_detected += 1
         side = Side.LONG if go_long else Side.SHORT
 
-        # Enter with maker order
-        await self._enter_position_maker(symbol, side, best_bid, best_ask, mid_price)
+        self.stats.signals_detected += 1
+
+        # Place maker order at current price (post_only ensures maker)
+        await self._enter_position_maker(symbol, side, current_price, current_price, current_price)
 
     # =========================================================================
     # Trade Execution (Grid Market Maker)
@@ -704,13 +686,15 @@ class PointsFarmer:
             margin = usdc_balance * POSITION_SIZE_PCT
             notional = margin * effective_leverage
 
-            # Set entry price at best bid (for long) or best ask (for short)
-            # This ensures we're providing liquidity, not taking it
+            # Place order slightly away from current price to ensure maker execution
+            # LONG: Place bid slightly below market (will fill if price dips)
+            # SHORT: Place ask slightly above market (will fill if price rises)
+            # Using MIN_SPREAD_PCT as the offset (0.02%)
             if side == Side.LONG:
-                entry_price = best_bid  # Buy at bid = maker
+                entry_price = mid_price * (1 - MIN_SPREAD_PCT)  # Bid below market
                 order_side = "Bid"
             else:
-                entry_price = best_ask  # Sell at ask = maker
+                entry_price = mid_price * (1 + MIN_SPREAD_PCT)  # Ask above market
                 order_side = "Ask"
 
             quantity = notional / entry_price
