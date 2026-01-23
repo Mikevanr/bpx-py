@@ -343,10 +343,21 @@ class PointsFarmer:
 
     async def _backpack_price_loop(self) -> None:
         """Fetch Backpack prices periodically and detect wicks for non-Binance tokens."""
+        first_run = True
         while self._running:
             try:
                 tickers = await self.public.get_tickers()
                 timestamp = time.time()
+
+                # Debug: print SKR-related symbols on first run
+                if first_run and self.debug:
+                    first_run = False
+                    if isinstance(tickers, list):
+                        skr_symbols = [t.get("symbol") for t in tickers if "SKR" in str(t.get("symbol", "")).upper()]
+                        print(f"[DEBUG] Backpack SKR symbols: {skr_symbols}")
+                    elif isinstance(tickers, dict):
+                        skr_symbols = [s for s in tickers.keys() if "SKR" in s.upper()]
+                        print(f"[DEBUG] Backpack SKR symbols: {skr_symbols}")
 
                 if isinstance(tickers, list):
                     for ticker in tickers:
