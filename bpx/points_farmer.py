@@ -1657,6 +1657,8 @@ class PointsFarmer:
         }
 
         decimals = QTY_DECIMALS.get(symbol, 0)  # Default to integer for unknown symbols
+        if decimals == 0:
+            return int(quantity)  # Return as integer, not float with .0
         return round(quantity, decimals)
 
     def _round_price(self, symbol: str, price: float) -> float:
@@ -1669,6 +1671,8 @@ class PointsFarmer:
             return round(price, 2)  # $0.01 tick
         elif "ZEC" in symbol:
             return round(price, 2)  # $0.01 tick
+        elif "SKR" in symbol:
+            return round(price, 6)  # $0.000001 tick for small price tokens
         else:
             return round(price, 4)  # Default
 
