@@ -723,8 +723,13 @@ class PointsFarmer:
             if quantity <= 0:
                 return
 
-            # Force integer for SKR quantities
-            qty_str = str(int(quantity)) if "SKR" in symbol else str(quantity)
+            # Force integer for SKR quantities, round to nearest 10 (lot size)
+            if "SKR" in symbol:
+                qty_int = int(quantity)
+                qty_int = (qty_int // 10) * 10  # Round down to nearest 10
+                qty_str = str(qty_int)
+            else:
+                qty_str = str(quantity)
 
             print(f"[{symbol}] MAKER {side_str} qty={qty_str} @ ${entry_price:.6f} (${notional:.0f} notional)")
 
@@ -739,7 +744,7 @@ class PointsFarmer:
             )
 
             # Debug: log the API response
-            print(f"[{symbol}] API Response: {result}")
+            print(f"[{symbol}] API Response: {result}", flush=True)
 
             if isinstance(result, dict) and result.get("id"):
                 order_id = result["id"]
