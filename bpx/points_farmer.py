@@ -349,15 +349,20 @@ class PointsFarmer:
                 tickers = await self.public.get_tickers()
                 timestamp = time.time()
 
-                # Debug: print SKR-related symbols on first run
-                if first_run and self.debug:
+                # Debug: print all available perp symbols on first run
+                if first_run:
                     first_run = False
                     if isinstance(tickers, list):
-                        skr_symbols = [t.get("symbol") for t in tickers if "SKR" in str(t.get("symbol", "")).upper()]
-                        print(f"[DEBUG] Backpack SKR symbols: {skr_symbols}")
+                        all_symbols = [t.get("symbol") for t in tickers]
+                        perp_symbols = [s for s in all_symbols if s and "PERP" in s]
+                        print(f"[DEBUG] All Backpack perp symbols ({len(perp_symbols)}): {perp_symbols[:20]}...")
+                        skr_symbols = [s for s in all_symbols if s and "SKR" in s.upper()]
+                        print(f"[DEBUG] SKR symbols found: {skr_symbols}")
                     elif isinstance(tickers, dict):
+                        perp_symbols = [s for s in tickers.keys() if "PERP" in s]
+                        print(f"[DEBUG] All Backpack perp symbols ({len(perp_symbols)}): {perp_symbols[:20]}...")
                         skr_symbols = [s for s in tickers.keys() if "SKR" in s.upper()]
-                        print(f"[DEBUG] Backpack SKR symbols: {skr_symbols}")
+                        print(f"[DEBUG] SKR symbols found: {skr_symbols}")
 
                 if isinstance(tickers, list):
                     for ticker in tickers:
