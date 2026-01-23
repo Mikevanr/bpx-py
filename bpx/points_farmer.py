@@ -53,19 +53,18 @@ BINANCE_TO_BACKPACK: Dict[str, str] = {v: k for k, v in BINANCE_TICKERS.items()}
 # SKR VOLUME FARMING PARAMETERS
 # =============================================================================
 
-# Position Sizing - calculated for $2 max loss
-# With 5x leverage and 4% stop loss: $2 = notional × 0.04 → notional = $50
+# Position Sizing - use 75% of available collateral
 MAX_CONCURRENT_POSITIONS = 1  # Only SKR
-POSITION_SIZE_USD = 50        # $50 notional per position
-MAX_LOSS_USD = 2.00           # Hard stop at $2 loss per position
+POSITION_SIZE_PCT = 0.75      # 75% of collateral as margin
+# With 5x leverage: margin × 5 = notional
 
 # Momentum Detection
 MOMENTUM_THRESHOLD = 0.003    # 0.3% move triggers entry
 MOMENTUM_WINDOW = 10.0        # 10 second window to detect momentum
 
-# Take Profit & Stop Loss (based on $ amount, not %)
-TP_USD = 1.00                 # Take $1 profit
-SL_USD = 2.00                 # Stop at $2 loss
+# Take Profit & Stop Loss (percentage based)
+TP_PCT = 0.02                 # 2% profit on notional (10% on margin with 5x)
+SL_PCT = 0.04                 # 4% loss on notional (20% on margin with 5x)
 
 # Order Management
 MAX_ORDER_AGE = 30.0          # Cancel unfilled orders after 30 seconds
@@ -73,6 +72,7 @@ MAX_POSITION_TIME = 300       # Hold up to 5 minutes
 
 # Risk Management
 MAX_DAILY_LOSS = 20.00        # Stop trading if daily loss exceeds $20
+MAX_LOSS_PER_SYMBOL = -10.00  # Pause symbol if cumulative loss exceeds $10
 COOLDOWN_SECONDS = 5.0        # 5 seconds between trades
 
 # Safety
@@ -204,8 +204,8 @@ class PointsFarmer:
         print("=" * 60)
         print(f"Trading: SKR_USD_PERP (5x leverage)")
         print(f"Strategy: Replicate Binance SKRUSDT price movement")
-        print(f"Position size: ${POSITION_SIZE_USD} notional")
-        print(f"Risk: TP=${TP_USD} | SL=${SL_USD} | Max daily loss=${MAX_DAILY_LOSS}")
+        print(f"Position size: {POSITION_SIZE_PCT*100}% of collateral × 5x leverage")
+        print(f"Risk: TP={TP_PCT*100}% | SL={SL_PCT*100}% | Max daily loss=${MAX_DAILY_LOSS}")
         print(f"Momentum: {MOMENTUM_THRESHOLD*100}% move in {MOMENTUM_WINDOW}s triggers entry")
         print("=" * 60)
 
@@ -679,13 +679,20 @@ class PointsFarmer:
             return
 
         try:
-            # SKR: $50 notional with 5x leverage = $10 margin
-            # Max loss $2 = 4% of notional = 20% of margin
-            leverage = LEVERAGE[symbol]  # 5x for SKR
-            notional = POSITION_SIZE_USD  # $50
-            margin = notional / leverage
+            # Get collateral and calculate position size (75% of collateral)
+            collateral = await self.account.get_collateral()
+            usdc_balance = self._get_usdc_balance(collateral)
 
-            # Use market order for immediate fill (SKR may have low liquidity)
+            if usdc_balance <= 0:
+                print(f"[{symbol}] No collateral available")
+                return
+
+            leverage = LEVERAGE[symbol]  # 5x for SKR
+            margin = usdc_balance * POSITION_SIZE_PCT  # 75% of collateral
+            notional = margin * leverage  # margin × 5x
+
+            print(f"[{symbol}] Collateral: ${usdc_balance:.2f} | Using ${margin:.2f} margin | ${notional:.2f} notional")
+
             entry_price = mid_price
 
             if side == Side.LONG:
@@ -719,7 +726,7 @@ class PointsFarmer:
                 if order_status == "Filled":
                     # Immediately filled (rare for maker order)
                     fill_price = float(result.get("price") or entry_price)
-                    await self._on_entry_filled(symbol, side, fill_price, quantity, order_id, margin, effective_leverage)
+                    await self._on_entry_filled(symbol, side, fill_price, quantity, order_id, margin, leverage)
                 else:
                     # Order is open, waiting for fill
                     state.pending_entry_order_id = order_id
@@ -731,7 +738,7 @@ class PointsFarmer:
                         "quantity": quantity,
                         "price": entry_price,
                         "margin": margin,
-                        "leverage": effective_leverage,
+                        "leverage": leverage,
                     }
             else:
                 error_msg = result.get("message", str(result)) if isinstance(result, dict) else str(result)
@@ -758,13 +765,11 @@ class PointsFarmer:
         side_str = "LONG" if side == Side.LONG else "SHORT"
         print(f"[{symbol}] FILLED {side_str} @ ${fill_price:.2f}")
 
-        # Calculate TP price based on $1 profit target
-        # TP_USD / notional = price change needed
-        tp_pct = TP_USD / notional  # e.g., $1 / $50 = 2%
+        # Calculate TP price based on percentage target
         if side == Side.LONG:
-            tp_price = fill_price * (1 + tp_pct)
+            tp_price = fill_price * (1 + TP_PCT)
         else:
-            tp_price = fill_price * (1 - tp_pct)
+            tp_price = fill_price * (1 - TP_PCT)
 
         tp_price = self._round_price(symbol, tp_price)
 
@@ -1119,13 +1124,13 @@ class PointsFarmer:
 
                     time_held = now - position.entry_time
 
-                    # ========== TAKE PROFIT: $1 target ==========
-                    if unrealized_pnl >= TP_USD:
+                    # ========== TAKE PROFIT: 2% on notional ==========
+                    if pnl_pct >= TP_PCT:
                         await self._close_position_emergency(symbol, position, "TP", unrealized_pnl)
                         continue
 
-                    # ========== STOP LOSS: $2 max loss ==========
-                    if unrealized_pnl <= -SL_USD:
+                    # ========== STOP LOSS: 4% on notional ==========
+                    if pnl_pct <= -SL_PCT:
                         await self._close_position_emergency(symbol, position, "SL", unrealized_pnl)
                         continue
 
@@ -1137,7 +1142,7 @@ class PointsFarmer:
                     # Log status every 10 seconds
                     if int(time_held) % 10 == 0 and int(time_held) > 0:
                         side_str = "L" if position.side == Side.LONG else "S"
-                        print(f"[{symbol}] {side_str} | P/L: ${unrealized_pnl:+.2f} (TP=${TP_USD} SL=-${SL_USD}) | {time_held:.0f}s")
+                        print(f"[{symbol}] {side_str} | {pnl_pct*100:+.2f}% (${unrealized_pnl:+.2f}) | TP={TP_PCT*100}% SL=-{SL_PCT*100}% | {time_held:.0f}s")
 
             except Exception as e:
                 print(f"Monitor error: {e}")
@@ -1278,7 +1283,7 @@ class PointsFarmer:
                             state.position.quantity = abs(actual_size)
                             state.position.entry_time = time.time()
                             # TP/SL based on USD
-                            print(f"    TP: +${TP_USD} | SL: -${SL_USD}")
+                            print(f"    TP: +{TP_PCT*100}% | SL: -{SL_PCT*100}%")
                     else:
                         # No pending entry - check if position is still open
                         if abs(actual_size) < 0.00001:
@@ -1415,7 +1420,7 @@ class PointsFarmer:
             side_str = "Long" if side == Side.LONG else "Short"
             print(f"*** ADOPTED POSITION: {symbol} {side_str} {quantity:.6f} @ {entry_price:.2f} ***")
             print(f"    Notional: ${notional_value:.2f} | Margin: ${margin:.2f} | Leverage: {leverage:.0f}x")
-            print(f"    TP: +${TP_USD} | SL: -${SL_USD}")
+            print(f"    TP: +{TP_PCT*100}% | SL: -{SL_PCT*100}%")
 
         except Exception as e:
             print(f"Error adopting position {symbol}: {e}")
@@ -1434,7 +1439,7 @@ class PointsFarmer:
                         continue
 
                     # Check if order is stale
-                    if time.time() - state.pending_entry_time > STALE_ORDER_TIMEOUT:
+                    if time.time() - state.pending_entry_time > MAX_ORDER_AGE:
                         try:
                             await self.account.cancel_order(
                                 symbol=symbol, order_id=state.pending_entry_order_id
@@ -1631,6 +1636,8 @@ class PointsFarmer:
             "WLFI_USDC_PERP": 0,   # 1 WLFI
             "kBONK_USDC_PERP": 0,  # 1 kBONK (already in thousands)
             "kPEPE_USDC_PERP": 0,  # 1 kPEPE (already in thousands)
+            # USD-based perps
+            "SKR_USD_PERP": 0,     # 1 SKR (integer quantities)
         }
 
         decimals = QTY_DECIMALS.get(symbol, 0)  # Default to integer for unknown symbols
