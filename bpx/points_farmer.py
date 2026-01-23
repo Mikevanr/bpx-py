@@ -738,6 +738,9 @@ class PointsFarmer:
                 post_only=True,  # CRITICAL: Ensures maker-only, rejects if would be taker
             )
 
+            # Debug: log the API response
+            print(f"[{symbol}] API Response: {result}")
+
             if isinstance(result, dict) and result.get("id"):
                 order_id = result["id"]
                 order_status = result.get("status", "")
