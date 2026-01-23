@@ -1141,7 +1141,7 @@ class PointsFarmer:
                     if not current_price:
                         continue
 
-                    # Calculate P/L
+                    # Calculate P/L (on notional for TP/SL checks)
                     if position.side == Side.LONG:
                         unrealized_pnl = (current_price - position.entry_price) * position.quantity
                         pnl_pct = (current_price - position.entry_price) / position.entry_price
@@ -1149,14 +1149,18 @@ class PointsFarmer:
                         unrealized_pnl = (position.entry_price - current_price) * position.quantity
                         pnl_pct = (position.entry_price - current_price) / position.entry_price
 
+                    # Margin P/L % = notional P/L % × leverage
+                    leverage = position.leverage if position.leverage else LEVERAGE.get(symbol, 5)
+                    margin_pnl_pct = pnl_pct * leverage
+
                     time_held = now - position.entry_time
 
-                    # ========== TAKE PROFIT: 2% on notional ==========
+                    # ========== TAKE PROFIT: 2% on notional (10% on margin) ==========
                     if pnl_pct >= TP_PCT:
                         await self._close_position_emergency(symbol, position, "TP", unrealized_pnl)
                         continue
 
-                    # ========== STOP LOSS: 4% on notional ==========
+                    # ========== STOP LOSS: 4% on notional (20% on margin) ==========
                     if pnl_pct <= -SL_PCT:
                         await self._close_position_emergency(symbol, position, "SL", unrealized_pnl)
                         continue
@@ -1169,7 +1173,10 @@ class PointsFarmer:
                     # Log status every 10 seconds
                     if int(time_held) % 10 == 0 and int(time_held) > 0:
                         side_str = "L" if position.side == Side.LONG else "S"
-                        print(f"[{symbol}] {side_str} | {pnl_pct*100:+.2f}% (${unrealized_pnl:+.2f}) | TP={TP_PCT*100}% SL=-{SL_PCT*100}% | {time_held:.0f}s")
+                        # Show margin P/L % (what trader actually earns/loses)
+                        tp_margin = TP_PCT * leverage * 100  # e.g., 2% × 5 = 10%
+                        sl_margin = SL_PCT * leverage * 100  # e.g., 4% × 5 = 20%
+                        print(f"[{symbol}] {side_str} | {margin_pnl_pct*100:+.1f}% on margin (${unrealized_pnl:+.2f}) | TP={tp_margin:.0f}% SL=-{sl_margin:.0f}% | {time_held:.0f}s")
 
             except Exception as e:
                 print(f"Monitor error: {e}")
@@ -1310,7 +1317,7 @@ class PointsFarmer:
                             state.position.quantity = abs(actual_size)
                             state.position.entry_time = time.time()
                             # TP/SL based on USD
-                            print(f"    TP: +{TP_PCT*100}% | SL: -{SL_PCT*100}%")
+                            print(f"    TP: +{TP_PCT*100*5}% on margin | SL: -{SL_PCT*100*5}% on margin")
                     else:
                         # No pending entry - check if position is still open
                         if abs(actual_size) < 0.00001:
@@ -1447,7 +1454,7 @@ class PointsFarmer:
             side_str = "Long" if side == Side.LONG else "Short"
             print(f"*** ADOPTED POSITION: {symbol} {side_str} {quantity:.6f} @ {entry_price:.2f} ***")
             print(f"    Notional: ${notional_value:.2f} | Margin: ${margin:.2f} | Leverage: {leverage:.0f}x")
-            print(f"    TP: +{TP_PCT*100}% | SL: -{SL_PCT*100}%")
+            print(f"    TP: +{TP_PCT*100*5}% on margin | SL: -{SL_PCT*100*5}% on margin")
 
         except Exception as e:
             print(f"Error adopting position {symbol}: {e}")
