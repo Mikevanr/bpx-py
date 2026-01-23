@@ -1,20 +1,14 @@
 """
-Backpack Exchange Grid Market Maker
+Backpack Exchange Volume Farmer - SKR
 
-Points farming bot with maker-only orders for minimal fees.
-Generates high volume while maintaining profitability.
+Volume farming bot for SKR_USD_PERP on Backpack.
+Replicates Binance SKRUSDT price movements for directional trades.
 
 Strategy:
-- Place limit orders at best bid/ask (maker-only)
-- When filled, place take-profit order at entry ± profit target
-- All orders use post_only flag = guaranteed 0.01% maker fee (VIP1)
-- No directional bias - profit from spread capture
-- High frequency, small profits, consistent volume
-
-Fee Math (VIP1):
-- Maker: 0.010% per side = 0.020% round trip
-- Target profit: 0.030% per trade
-- Net profit: ~0.010% per trade after fees
+- Monitor SKRUSDT on Binance for momentum
+- When price moves, replicate direction on Backpack
+- Small positions with strict $2 max loss per trade
+- 5x leverage (max for SKR)
 
 Usage:
     from bpx.points_farmer import PointsFarmer
@@ -39,54 +33,52 @@ from bpx.async_.private_websocket import PrivateWebsocket
 
 
 # =============================================================================
-# Configuration
+# Configuration - SKR ONLY
 # =============================================================================
 
-# Trading pairs - HIGH LIQUIDITY ONLY for tight spreads
+# Trading pair - SKR only
 LEVERAGE: Dict[str, int] = {
-    "BTC_USDC_PERP": 50,   # Bitcoin - most liquid
-    "ETH_USDC_PERP": 50,   # Ethereum - very liquid
-    "SOL_USDC_PERP": 50,   # Solana - good liquidity
+    "SKR_USD_PERP": 5,   # SKR max leverage is 5x
 }
 
-# Binance price feeds for signal detection
+# Binance price feed
 BINANCE_TICKERS: Dict[str, str] = {
-    "BTC_USDC_PERP": "btcusdt",
-    "ETH_USDC_PERP": "ethusdt",
-    "SOL_USDC_PERP": "solusdt",
+    "SKR_USD_PERP": "skrusdt",
 }
 
 # Reverse mapping
 BINANCE_TO_BACKPACK: Dict[str, str] = {v: k for k, v in BINANCE_TICKERS.items()}
 
 # =============================================================================
-# GRID MARKET MAKER PARAMETERS
+# SKR VOLUME FARMING PARAMETERS
 # =============================================================================
 
-# Position Sizing
-MAX_CONCURRENT_POSITIONS = 3  # One per symbol max
-POSITION_SIZE_PCT = 0.25      # 25% of collateral per position
-LEVERAGE_USAGE = 0.8          # Use 80% of max leverage
+# Position Sizing - calculated for $2 max loss
+# With 5x leverage and 4% stop loss: $2 = notional × 0.04 → notional = $50
+MAX_CONCURRENT_POSITIONS = 1  # Only SKR
+POSITION_SIZE_USD = 50        # $50 notional per position
+MAX_LOSS_USD = 2.00           # Hard stop at $2 loss per position
 
-# Profit Target (must cover fees + leave profit)
-# VIP1 fees: 0.01% maker per side = 0.02% round trip
-PROFIT_TARGET_PCT = 0.0003    # 0.03% profit target on notional
-MIN_SPREAD_PCT = 0.0002       # 0.02% minimum spread to enter (avoid tight spreads)
+# Momentum Detection
+MOMENTUM_THRESHOLD = 0.003    # 0.3% move triggers entry
+MOMENTUM_WINDOW = 10.0        # 10 second window to detect momentum
+
+# Take Profit & Stop Loss (based on $ amount, not %)
+TP_USD = 1.00                 # Take $1 profit
+SL_USD = 2.00                 # Stop at $2 loss
 
 # Order Management
-ORDER_REFRESH_SECONDS = 2.0   # Refresh unfilled orders every 2 seconds
-MAX_ORDER_AGE = 10.0          # Cancel orders older than 10 seconds
-MAX_POSITION_TIME = 120       # Force close after 2 minutes if TP not hit
+MAX_ORDER_AGE = 30.0          # Cancel unfilled orders after 30 seconds
+MAX_POSITION_TIME = 300       # Hold up to 5 minutes
 
 # Risk Management
-MAX_LOSS_PCT = 0.001          # 0.1% max loss per position (emergency exit)
-MAX_DAILY_LOSS = 25.00        # Stop trading if daily loss exceeds $25
-COOLDOWN_SECONDS = 0.5        # Short cooldown between order placements
+MAX_DAILY_LOSS = 20.00        # Stop trading if daily loss exceeds $20
+COOLDOWN_SECONDS = 5.0        # 5 seconds between trades
 
 # Safety
-MAX_PRICE_DEVIATION = 0.003   # 0.3% max deviation Binance vs Backpack
+MAX_PRICE_DEVIATION = 0.01    # 1% max deviation (SKR may have wider spread)
 
-# Binance WebSocket (for reference prices)
+# Binance WebSocket
 BINANCE_WS_URL = "wss://fstream.binance.com/stream"
 
 
@@ -208,13 +200,13 @@ class PointsFarmer:
         """Main entry point - runs the bot forever."""
         self._running = True
         print("=" * 60)
-        print("GRID MARKET MAKER - BTC/ETH/SOL")
+        print("SKR VOLUME FARMER - Follow Binance Momentum")
         print("=" * 60)
-        print(f"Trading pairs: {list(LEVERAGE.keys())}")
-        print(f"Strategy: Maker-only orders, capture spread + {PROFIT_TARGET_PCT*100:.2f}% profit")
-        print(f"Position size: {POSITION_SIZE_PCT*100}% of collateral")
-        print(f"Order refresh: {ORDER_REFRESH_SECONDS}s | Max age: {MAX_ORDER_AGE}s")
-        print(f"VIP1 fees: 0.01% maker | Target profit: {PROFIT_TARGET_PCT*100:.2f}%")
+        print(f"Trading: SKR_USD_PERP (5x leverage)")
+        print(f"Strategy: Replicate Binance SKRUSDT price movement")
+        print(f"Position size: ${POSITION_SIZE_USD} notional")
+        print(f"Risk: TP=${TP_USD} | SL=${SL_USD} | Max daily loss=${MAX_DAILY_LOSS}")
+        print(f"Momentum: {MOMENTUM_THRESHOLD*100}% move in {MOMENTUM_WINDOW}s triggers entry")
         print("=" * 60)
 
         try:
@@ -597,7 +589,7 @@ class PointsFarmer:
         state.pending_entry_order_id = None
 
     async def _check_grid_entry(self, symbol: str, state: SymbolState) -> None:
-        """Grid market maker - place maker orders using ticker prices (orderbook is broken)."""
+        """Follow Binance momentum - replicate price movement direction."""
         # Skip if paused or already in position
         if state.paused:
             return
@@ -617,9 +609,7 @@ class PointsFarmer:
 
         # Check for pending entry order
         if state.pending_entry_order_id:
-            # Check if order is too old
             if state.pending_entry_time and time.time() - state.pending_entry_time > MAX_ORDER_AGE:
-                # Cancel stale order
                 try:
                     await self.account.cancel_order(symbol=symbol, order_id=state.pending_entry_order_id)
                     print(f"[{symbol}] Cancelled stale entry order")
@@ -629,32 +619,48 @@ class PointsFarmer:
                 state.pending_entry_time = None
             return
 
-        # Get Binance reference price
-        binance_price = self._last_prices.get(symbol)
-        if not binance_price:
+        # Need enough price history
+        now = time.time()
+        prices = state.prices
+        window_prices = [p for p in prices if now - p.timestamp <= MOMENTUM_WINDOW]
+
+        if len(window_prices) < 3:
             return
 
-        # Get Backpack ticker price (reliable, unlike orderbook which returns stale data)
+        # Calculate momentum from Binance prices
+        oldest_price = window_prices[0].price
+        newest_price = window_prices[-1].price
+        momentum = (newest_price - oldest_price) / oldest_price
+
+        # Check if momentum exceeds threshold
+        if abs(momentum) < MOMENTUM_THRESHOLD:
+            return
+
+        # Get current Backpack price for execution
         backpack_price = self._backpack_prices.get(symbol)
         if not backpack_price:
             return
 
-        # Validate prices are in sync (< 0.3% difference)
-        price_diff = abs(backpack_price - binance_price) / binance_price
-        if price_diff > MAX_PRICE_DEVIATION:
-            return
-
-        # Use Backpack ticker as our reference price
-        current_price = backpack_price
-
-        # Alternate between long and short for balance
-        go_long = (self.stats.total_trades % 2 == 0)
-        side = Side.LONG if go_long else Side.SHORT
+        # Validate prices are roughly in sync
+        binance_price = self._last_prices.get(symbol)
+        if binance_price:
+            price_diff = abs(backpack_price - binance_price) / binance_price
+            if price_diff > MAX_PRICE_DEVIATION:
+                return
 
         self.stats.signals_detected += 1
+        direction = "UP" if momentum > 0 else "DOWN"
 
-        # Place maker order at current price (post_only ensures maker)
-        await self._enter_position_maker(symbol, side, current_price, current_price, current_price)
+        # FOLLOW the momentum (not fade it)
+        if momentum > 0:
+            side = Side.LONG
+            print(f"[{symbol}] MOMENTUM {direction}: {momentum*100:.2f}% → LONG")
+        else:
+            side = Side.SHORT
+            print(f"[{symbol}] MOMENTUM {direction}: {momentum*100:.2f}% → SHORT")
+
+        # Enter position
+        await self._enter_position_maker(symbol, side, backpack_price, backpack_price, backpack_price)
 
     # =========================================================================
     # Trade Execution (Grid Market Maker)
@@ -673,28 +679,18 @@ class PointsFarmer:
             return
 
         try:
-            # Get collateral for position sizing
-            collateral = await self.account.get_collateral()
-            usdc_balance = self._get_usdc_balance(collateral)
+            # SKR: $50 notional with 5x leverage = $10 margin
+            # Max loss $2 = 4% of notional = 20% of margin
+            leverage = LEVERAGE[symbol]  # 5x for SKR
+            notional = POSITION_SIZE_USD  # $50
+            margin = notional / leverage
 
-            if usdc_balance <= 0:
-                print(f"[{symbol}] No collateral available")
-                return
+            # Use market order for immediate fill (SKR may have low liquidity)
+            entry_price = mid_price
 
-            leverage = LEVERAGE[symbol]
-            effective_leverage = leverage * LEVERAGE_USAGE
-            margin = usdc_balance * POSITION_SIZE_PCT
-            notional = margin * effective_leverage
-
-            # Place order slightly away from current price to ensure maker execution
-            # LONG: Place bid slightly below market (will fill if price dips)
-            # SHORT: Place ask slightly above market (will fill if price rises)
-            # Using MIN_SPREAD_PCT as the offset (0.02%)
             if side == Side.LONG:
-                entry_price = mid_price * (1 - MIN_SPREAD_PCT)  # Bid below market
                 order_side = "Bid"
             else:
-                entry_price = mid_price * (1 + MIN_SPREAD_PCT)  # Ask above market
                 order_side = "Ask"
 
             quantity = notional / entry_price
@@ -762,11 +758,13 @@ class PointsFarmer:
         side_str = "LONG" if side == Side.LONG else "SHORT"
         print(f"[{symbol}] FILLED {side_str} @ ${fill_price:.2f}")
 
-        # Calculate TP price based on profit target
+        # Calculate TP price based on $1 profit target
+        # TP_USD / notional = price change needed
+        tp_pct = TP_USD / notional  # e.g., $1 / $50 = 2%
         if side == Side.LONG:
-            tp_price = fill_price * (1 + PROFIT_TARGET_PCT)
+            tp_price = fill_price * (1 + tp_pct)
         else:
-            tp_price = fill_price * (1 - PROFIT_TARGET_PCT)
+            tp_price = fill_price * (1 - tp_pct)
 
         tp_price = self._round_price(symbol, tp_price)
 
@@ -1121,34 +1119,25 @@ class PointsFarmer:
 
                     time_held = now - position.entry_time
 
-                    # ========== TP ORDER FILLED CHECK ==========
-                    # The TP is a limit order - check if it's been filled by checking order status
-                    if position.tp_order_id:
-                        try:
-                            orders = await self.account.get_open_orders(symbol=symbol)
-                            tp_still_open = any(o.get("id") == position.tp_order_id for o in orders) if isinstance(orders, list) else False
-                            if not tp_still_open:
-                                # TP order was filled!
-                                await self._on_tp_filled(symbol, position, unrealized_pnl)
-                                continue
-                        except Exception:
-                            pass
-
-                    # ========== EMERGENCY EXIT: MAX LOSS ==========
-                    if pnl_pct <= -MAX_LOSS_PCT:
-                        await self._close_position_emergency(symbol, position, "MAX_LOSS", unrealized_pnl)
+                    # ========== TAKE PROFIT: $1 target ==========
+                    if unrealized_pnl >= TP_USD:
+                        await self._close_position_emergency(symbol, position, "TP", unrealized_pnl)
                         continue
 
-                    # ========== EMERGENCY EXIT: TIMEOUT ==========
+                    # ========== STOP LOSS: $2 max loss ==========
+                    if unrealized_pnl <= -SL_USD:
+                        await self._close_position_emergency(symbol, position, "SL", unrealized_pnl)
+                        continue
+
+                    # ========== TIMEOUT ==========
                     if time_held >= MAX_POSITION_TIME:
                         await self._close_position_emergency(symbol, position, "TIMEOUT", unrealized_pnl)
                         continue
 
-                    # Log status every 15 seconds
-                    if int(time_held) % 15 == 0 and int(time_held) > 0:
+                    # Log status every 10 seconds
+                    if int(time_held) % 10 == 0 and int(time_held) > 0:
                         side_str = "L" if position.side == Side.LONG else "S"
-                        tp_target = PROFIT_TARGET_PCT * 100
-                        print(f"[{symbol}] {side_str} {pnl_pct*100:+.3f}% (TP={tp_target:.2f}%) | ${unrealized_pnl:+.2f} | {time_held:.0f}s")
+                        print(f"[{symbol}] {side_str} | P/L: ${unrealized_pnl:+.2f} (TP=${TP_USD} SL=-${SL_USD}) | {time_held:.0f}s")
 
             except Exception as e:
                 print(f"Monitor error: {e}")
@@ -1288,8 +1277,8 @@ class PointsFarmer:
                             state.position.entry_price = actual_entry
                             state.position.quantity = abs(actual_size)
                             state.position.entry_time = time.time()
-                            # TP is a limit order at entry +/- PROFIT_TARGET_PCT
-                            print(f"    TP target: {PROFIT_TARGET_PCT*100:.2f}% | Emergency exit: {MAX_LOSS_PCT*100:.2f}%")
+                            # TP/SL based on USD
+                            print(f"    TP: +${TP_USD} | SL: -${SL_USD}")
                     else:
                         # No pending entry - check if position is still open
                         if abs(actual_size) < 0.00001:
@@ -1405,8 +1394,8 @@ class PointsFarmer:
             side = Side.LONG if net_qty > 0 else Side.SHORT
             quantity = abs(net_qty)
 
-            # Get leverage for this symbol
-            leverage = LEVERAGE.get(symbol, 50) * LEVERAGE_USAGE
+            # Get leverage for this symbol (5x for SKR)
+            leverage = LEVERAGE.get(symbol, 5)
             margin = notional_value / leverage
 
             # Create position object with margin tracking
@@ -1426,7 +1415,7 @@ class PointsFarmer:
             side_str = "Long" if side == Side.LONG else "Short"
             print(f"*** ADOPTED POSITION: {symbol} {side_str} {quantity:.6f} @ {entry_price:.2f} ***")
             print(f"    Notional: ${notional_value:.2f} | Margin: ${margin:.2f} | Leverage: {leverage:.0f}x")
-            print(f"    TP target: {PROFIT_TARGET_PCT*100:.2f}% | Emergency exit: {MAX_LOSS_PCT*100:.2f}%")
+            print(f"    TP: +${TP_USD} | SL: -${SL_USD}")
 
         except Exception as e:
             print(f"Error adopting position {symbol}: {e}")
@@ -1511,8 +1500,8 @@ class PointsFarmer:
                 if c is None:
                     return "n/a"
                 color_prefix = ""
-                if abs(c) >= PROFIT_TARGET_PCT:
-                    color_prefix = "**"  # Highlight significant move
+                if abs(c) >= MOMENTUM_THRESHOLD:
+                    color_prefix = "**"  # Highlight momentum signal
                 return f"{color_prefix}{c*100:+.3f}%"
 
             short_symbol = symbol.replace("_USDC_PERP", "").replace("_USDT_PERP", "").replace("_USD_PERP", "")
