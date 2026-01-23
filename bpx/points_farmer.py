@@ -723,14 +723,17 @@ class PointsFarmer:
             if quantity <= 0:
                 return
 
-            print(f"[{symbol}] MAKER {side_str} {quantity} @ ${entry_price:.2f} (${notional:.0f} notional)")
+            # Force integer for SKR quantities
+            qty_str = str(int(quantity)) if "SKR" in symbol else str(quantity)
+
+            print(f"[{symbol}] MAKER {side_str} qty={qty_str} @ ${entry_price:.6f} (${notional:.0f} notional)")
 
             # Place limit order with post_only to guarantee maker
             result = await self.account.execute_order(
                 symbol=symbol,
                 side=order_side,
                 order_type="Limit",
-                quantity=str(quantity),
+                quantity=qty_str,
                 price=str(entry_price),
                 post_only=True,  # CRITICAL: Ensures maker-only, rejects if would be taker
             )
