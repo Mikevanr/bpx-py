@@ -38,12 +38,12 @@ from bpx.async_.private_websocket import PrivateWebsocket
 
 # Trading pair - SKR only
 LEVERAGE: Dict[str, int] = {
-    "SKR_USD_PERP": 5,   # SKR max leverage is 5x
+    "SKR_USDC_PERP": 5,   # SKR max leverage is 5x
 }
 
 # Binance price feed
 BINANCE_TICKERS: Dict[str, str] = {
-    "SKR_USD_PERP": "skrusdt",
+    "SKR_USDC_PERP": "skrusdt",
 }
 
 # Reverse mapping
@@ -202,7 +202,7 @@ class PointsFarmer:
         print("=" * 60)
         print("SKR VOLUME FARMER - Follow Binance Momentum")
         print("=" * 60)
-        print(f"Trading: SKR_USD_PERP (5x leverage)")
+        print(f"Trading: SKR_USDC_PERP (5x leverage)")
         print(f"Strategy: Replicate Binance SKRUSDT price movement")
         print(f"Position size: {POSITION_SIZE_PCT*100}% of collateral × 5x leverage")
         print(f"Risk: TP={TP_PCT*100}% | SL={SL_PCT*100}% | Max daily loss=${MAX_DAILY_LOSS}")
@@ -1652,8 +1652,8 @@ class PointsFarmer:
             "WLFI_USDC_PERP": 0,   # 1 WLFI
             "kBONK_USDC_PERP": 0,  # 1 kBONK (already in thousands)
             "kPEPE_USDC_PERP": 0,  # 1 kPEPE (already in thousands)
-            # USD-based perps
-            "SKR_USD_PERP": 0,     # 1 SKR (integer quantities)
+            # USDC-based perps
+            "SKR_USDC_PERP": 0,    # 1 SKR (integer quantities)
         }
 
         decimals = QTY_DECIMALS.get(symbol, 0)  # Default to integer for unknown symbols
