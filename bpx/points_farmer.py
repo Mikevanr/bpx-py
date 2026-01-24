@@ -36,14 +36,14 @@ from bpx.async_.private_websocket import PrivateWebsocket
 # Configuration - SKR ONLY
 # =============================================================================
 
-# Trading pair - SKR only
+# Trading pair - BTC only
 LEVERAGE: Dict[str, int] = {
-    "SKR_USDC_PERP": 5,   # SKR max leverage is 5x
+    "BTC_USDC_PERP": 50,   # BTC max leverage is 50x
 }
 
 # Binance price feed
 BINANCE_TICKERS: Dict[str, str] = {
-    "SKR_USDC_PERP": "skrusdt",
+    "BTC_USDC_PERP": "btcusdt",
 }
 
 # Reverse mapping
@@ -63,12 +63,13 @@ MOMENTUM_THRESHOLD = 0.003    # 0.3% move triggers entry
 MOMENTUM_WINDOW = 10.0        # 10 second window to detect momentum
 
 # Take Profit & Stop Loss (on margin, accounting for leverage)
-# With 5x leverage: margin % = notional % × 5
+# margin % = notional % × leverage
 TP_MARGIN_PCT = 0.02          # 2% profit on margin
 SL_MARGIN_PCT = 0.04          # 4% loss on margin
-# Convert to notional % for price comparison
-TP_PCT = TP_MARGIN_PCT / 5    # 0.4% on notional = 2% on margin
-SL_PCT = SL_MARGIN_PCT / 5    # 0.8% on notional = 4% on margin
+# Convert to notional % for price comparison (use first symbol's leverage)
+DEFAULT_LEVERAGE = list(LEVERAGE.values())[0]  # 50x for BTC
+TP_PCT = TP_MARGIN_PCT / DEFAULT_LEVERAGE    # 0.04% on notional = 2% on margin with 50x
+SL_PCT = SL_MARGIN_PCT / DEFAULT_LEVERAGE    # 0.08% on notional = 4% on margin with 50x
 
 # Order Management
 MAX_ORDER_AGE = 30.0          # Cancel unfilled orders after 30 seconds
@@ -204,11 +205,14 @@ class PointsFarmer:
         """Main entry point - runs the bot forever."""
         self._running = True
         print("=" * 60)
-        print("SKR VOLUME FARMER - Follow Binance Momentum")
+        print("BTC VOLUME FARMER - Follow Binance Momentum")
         print("=" * 60)
-        print(f"Trading: SKR_USDC_PERP (5x leverage)")
-        print(f"Strategy: Replicate Binance SKRUSDT price movement")
-        print(f"Position size: {POSITION_SIZE_PCT*100}% of collateral × 5x leverage")
+        symbol = list(LEVERAGE.keys())[0]
+        leverage = LEVERAGE[symbol]
+        print(f"Trading: {symbol} ({leverage}x leverage)")
+        binance_ticker = BINANCE_TICKERS[symbol].upper()
+        print(f"Strategy: Replicate Binance {binance_ticker} price movement")
+        print(f"Position size: {POSITION_SIZE_PCT*100}% of collateral × {leverage}x leverage")
         print(f"Risk: TP={TP_PCT*100}% | SL={SL_PCT*100}% | Max daily loss=${MAX_DAILY_LOSS}")
         print(f"Momentum: {MOMENTUM_THRESHOLD*100}% move in {MOMENTUM_WINDOW}s triggers entry")
         print("=" * 60)
@@ -727,13 +731,8 @@ class PointsFarmer:
             if quantity <= 0:
                 return
 
-            # Force integer for SKR quantities, round to nearest 10 (lot size)
-            if "SKR" in symbol:
-                qty_int = int(quantity)
-                qty_int = (qty_int // 10) * 10  # Round down to nearest 10
-                qty_str = str(qty_int)
-            else:
-                qty_str = str(quantity)
+            # Format quantity based on symbol precision
+            qty_str = str(quantity)
 
             print(f"[{symbol}] MAKER {side_str} qty={qty_str} @ ${entry_price:.6f} (${notional:.0f} notional)")
 
@@ -1321,7 +1320,7 @@ class PointsFarmer:
                             state.position.quantity = abs(actual_size)
                             state.position.entry_time = time.time()
                             # TP/SL based on USD
-                            print(f"    TP: +{TP_PCT*100*5}% on margin | SL: -{SL_PCT*100*5}% on margin")
+                            print(f"    TP: +{TP_MARGIN_PCT*100}% on margin | SL: -{SL_MARGIN_PCT*100}% on margin")
                     else:
                         # No pending entry - check if position is still open
                         if abs(actual_size) < 0.00001:
@@ -1458,7 +1457,7 @@ class PointsFarmer:
             side_str = "Long" if side == Side.LONG else "Short"
             print(f"*** ADOPTED POSITION: {symbol} {side_str} {quantity:.6f} @ {entry_price:.2f} ***")
             print(f"    Notional: ${notional_value:.2f} | Margin: ${margin:.2f} | Leverage: {leverage:.0f}x")
-            print(f"    TP: +{TP_PCT*100*5}% on margin | SL: -{SL_PCT*100*5}% on margin")
+            print(f"    TP: +{TP_MARGIN_PCT*100}% on margin | SL: -{SL_MARGIN_PCT*100}% on margin")
 
         except Exception as e:
             print(f"Error adopting position {symbol}: {e}")
