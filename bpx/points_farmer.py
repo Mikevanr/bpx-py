@@ -734,16 +734,14 @@ class PointsFarmer:
             # Format quantity based on symbol precision
             qty_str = str(quantity)
 
-            print(f"[{symbol}] MAKER {side_str} qty={qty_str} @ ${entry_price:.6f} (${notional:.0f} notional)")
+            print(f"[{symbol}] MARKET {side_str} qty={qty_str} @ ~${entry_price:.2f} (${notional:.0f} notional)")
 
-            # Place limit order with post_only to guarantee maker
+            # Place market order for immediate execution (taker)
             result = await self.account.execute_order(
                 symbol=symbol,
                 side=order_side,
-                order_type="Limit",
+                order_type="Market",
                 quantity=qty_str,
-                price=str(entry_price),
-                post_only=True,  # CRITICAL: Ensures maker-only, rejects if would be taker
             )
 
             # Debug: log the API response
@@ -753,15 +751,15 @@ class PointsFarmer:
                 order_id = result["id"]
                 order_status = result.get("status", "")
 
+                # Market orders should fill immediately
                 if order_status == "Filled":
-                    # Immediately filled (rare for maker order)
-                    fill_price = float(result.get("price") or entry_price)
-                    await self._on_entry_filled(symbol, side, fill_price, quantity, order_id, margin, leverage)
+                    fill_price = float(result.get("price") or result.get("avgPrice") or entry_price)
+                    fill_qty = float(result.get("executedQuantity") or quantity)
+                    await self._on_entry_filled(symbol, side, fill_price, fill_qty, order_id, margin, leverage)
                 else:
-                    # Order is open, waiting for fill
+                    # Rare: market order pending (shouldn't happen)
                     state.pending_entry_order_id = order_id
                     state.pending_entry_time = time.time()
-                    # Store order info for when it fills
                     self._pending_fills[order_id] = {
                         "symbol": symbol,
                         "side": side,
@@ -772,11 +770,7 @@ class PointsFarmer:
                     }
             else:
                 error_msg = result.get("message", str(result)) if isinstance(result, dict) else str(result)
-                if "post-only" in error_msg.lower() or "would immediately match" in error_msg.lower():
-                    # Post-only rejected - price moved, try again next cycle
-                    pass
-                else:
-                    print(f"[{symbol}] Order error: {error_msg}")
+                print(f"[{symbol}] Order error: {error_msg}")
 
         except Exception as e:
             print(f"[{symbol}] Entry error: {e}")
