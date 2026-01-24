@@ -62,14 +62,22 @@ POSITION_SIZE_PCT = 0.75      # 75% of collateral as margin
 MOMENTUM_THRESHOLD = 0.003    # 0.3% move triggers entry
 MOMENTUM_WINDOW = 10.0        # 10 second window to detect momentum
 
-# Take Profit & Stop Loss (on margin, accounting for leverage)
+# Take Profit & Stop Loss (on margin, accounting for leverage AND fees)
+# Taker fee: 0.026% per side = 0.052% round trip
+TAKER_FEE_PCT = 0.00026       # 0.026% per side
+ROUND_TRIP_FEE_PCT = TAKER_FEE_PCT * 2  # 0.052% for entry + exit
+
 # margin % = notional % × leverage
-TP_MARGIN_PCT = 0.02          # 2% profit on margin
+TP_MARGIN_PCT = 0.02          # 2% profit on margin (AFTER fees)
 SL_MARGIN_PCT = 0.04          # 4% loss on margin
+
 # Convert to notional % for price comparison (use first symbol's leverage)
 DEFAULT_LEVERAGE = list(LEVERAGE.values())[0]  # 50x for BTC
-TP_PCT = TP_MARGIN_PCT / DEFAULT_LEVERAGE    # 0.04% on notional = 2% on margin with 50x
-SL_PCT = SL_MARGIN_PCT / DEFAULT_LEVERAGE    # 0.08% on notional = 4% on margin with 50x
+
+# TP must cover: fees + target profit
+# TP on notional = (target margin % / leverage) + round trip fees
+TP_PCT = (TP_MARGIN_PCT / DEFAULT_LEVERAGE) + ROUND_TRIP_FEE_PCT  # 0.04% + 0.052% = 0.092%
+SL_PCT = SL_MARGIN_PCT / DEFAULT_LEVERAGE    # 0.08% on notional = 4% on margin
 
 # Order Management
 MAX_ORDER_AGE = 30.0          # Cancel unfilled orders after 30 seconds
@@ -213,7 +221,9 @@ class PointsFarmer:
         binance_ticker = BINANCE_TICKERS[symbol].upper()
         print(f"Strategy: Replicate Binance {binance_ticker} price movement")
         print(f"Position size: {POSITION_SIZE_PCT*100}% of collateral × {leverage}x leverage")
-        print(f"Risk: TP={TP_PCT*100}% | SL={SL_PCT*100}% | Max daily loss=${MAX_DAILY_LOSS}")
+        print(f"Risk: TP={TP_PCT*100:.3f}% price move (={TP_MARGIN_PCT*100}% margin after fees) | SL={SL_PCT*100:.3f}%")
+        print(f"Fees: {ROUND_TRIP_FEE_PCT*100:.3f}% round trip (taker)")
+        print(f"Max daily loss: ${MAX_DAILY_LOSS}")
         print(f"Momentum: {MOMENTUM_THRESHOLD*100}% move in {MOMENTUM_WINDOW}s triggers entry")
         print("=" * 60)
 
