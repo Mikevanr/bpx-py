@@ -62,9 +62,13 @@ POSITION_SIZE_PCT = 0.75      # 75% of collateral as margin
 MOMENTUM_THRESHOLD = 0.003    # 0.3% move triggers entry
 MOMENTUM_WINDOW = 10.0        # 10 second window to detect momentum
 
-# Take Profit & Stop Loss (percentage based)
-TP_PCT = 0.02                 # 2% profit on notional (10% on margin with 5x)
-SL_PCT = 0.04                 # 4% loss on notional (20% on margin with 5x)
+# Take Profit & Stop Loss (on margin, accounting for leverage)
+# With 5x leverage: margin % = notional % × 5
+TP_MARGIN_PCT = 0.02          # 2% profit on margin
+SL_MARGIN_PCT = 0.04          # 4% loss on margin
+# Convert to notional % for price comparison
+TP_PCT = TP_MARGIN_PCT / 5    # 0.4% on notional = 2% on margin
+SL_PCT = SL_MARGIN_PCT / 5    # 0.8% on notional = 4% on margin
 
 # Order Management
 MAX_ORDER_AGE = 30.0          # Cancel unfilled orders after 30 seconds
