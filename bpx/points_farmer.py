@@ -833,8 +833,8 @@ class PointsFarmer:
             leverage=leverage,
         )
 
-        # Place TP order (maker-only)
-        await self._place_tp_order_maker(symbol, state.position)
+        # Don't place TP order - we use trailing stop instead
+        # The position will be closed by the monitor loop
 
         self.stats.total_trades += 1
         self.stats.total_volume += notional
@@ -1297,23 +1297,31 @@ class PointsFarmer:
 
             # Recalculate actual PnL
             if position.side == Side.LONG:
-                actual_pnl = (close_price - position.entry_price) * position.quantity
+                gross_pnl = (close_price - position.entry_price) * position.quantity
             else:
-                actual_pnl = (position.entry_price - close_price) * position.quantity
+                gross_pnl = (position.entry_price - close_price) * position.quantity
 
-            # Update stats
-            self.stats.total_pnl += actual_pnl
-            self.stats.daily_pnl += actual_pnl
+            # Calculate fees (round trip: entry + exit)
+            estimated_fees = position.notional * ROUND_TRIP_FEE_PCT
+            net_pnl = gross_pnl - estimated_fees
+
+            # Update stats with NET P/L (after fees)
+            self.stats.total_pnl += net_pnl
+            self.stats.daily_pnl += net_pnl
             self.stats.total_volume += position.notional
-            self.stats.losses += 1
-            state.cumulative_pnl += actual_pnl
+            if net_pnl >= 0:
+                self.stats.wins += 1
+            else:
+                self.stats.losses += 1
+            state.cumulative_pnl += net_pnl
 
-            # Log the close
+            # Log the close with fees
             side_str = "LONG" if position.side == Side.LONG else "SHORT"
-            pnl_str = f"+${actual_pnl:.2f}" if actual_pnl >= 0 else f"-${abs(actual_pnl):.2f}"
             win_rate = self.stats.wins / self.stats.total_trades * 100 if self.stats.total_trades > 0 else 0
 
-            print(f"EMERGENCY {symbol} [{reason}] {side_str} | Entry=${position.entry_price:.2f} Exit=${close_price:.2f} | {pnl_str} | W/L: {self.stats.wins}/{self.stats.losses} ({win_rate:.0f}%) [TAKER]")
+            print(f"CLOSE {symbol} [{reason}] {side_str} | Entry=${position.entry_price:.2f} Exit=${close_price:.2f}")
+            print(f"    Gross: ${gross_pnl:+.2f} | Fees: -${estimated_fees:.2f} | Net: ${net_pnl:+.2f}")
+            print(f"    Session: ${self.stats.total_pnl:+.2f} | W/L: {self.stats.wins}/{self.stats.losses} ({win_rate:.0f}%)")
 
             # Clear position
             state.position = None
