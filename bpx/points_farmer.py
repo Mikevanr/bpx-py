@@ -167,6 +167,8 @@ class Stats:
     wins: int = 0
     losses: int = 0
     daily_pnl: float = 0.0  # Track daily P/L for risk management
+    starting_balance: float = 0.0  # Track starting balance for actual P/L
+    current_balance: float = 0.0   # Track current balance
 
 
 # =============================================================================
@@ -243,6 +245,8 @@ class PointsFarmer:
             # Get initial balance from collateral (for perps trading)
             collateral = await self.account.get_collateral()
             usdc_balance = self._get_usdc_balance(collateral)
+            self.stats.starting_balance = usdc_balance
+            self.stats.current_balance = usdc_balance
             print(f"Starting USDC balance (perps): ${usdc_balance:.2f}")
 
             # Connect to Backpack private websocket for real-time updates
@@ -1295,33 +1299,36 @@ class PointsFarmer:
             if isinstance(result, dict):
                 close_price = float(result.get("avgPrice") or result.get("price") or close_price)
 
-            # Recalculate actual PnL
+            # Recalculate gross PnL for logging
             if position.side == Side.LONG:
                 gross_pnl = (close_price - position.entry_price) * position.quantity
             else:
                 gross_pnl = (position.entry_price - close_price) * position.quantity
 
-            # Calculate fees (round trip: entry + exit)
-            estimated_fees = position.notional * ROUND_TRIP_FEE_PCT
-            net_pnl = gross_pnl - estimated_fees
+            # Fetch ACTUAL balance after close (this includes all fees)
+            await asyncio.sleep(0.5)  # Brief wait for balance to update
+            collateral = await self.account.get_collateral()
+            new_balance = self._get_usdc_balance(collateral)
+            self.stats.current_balance = new_balance
 
-            # Update stats with NET P/L (after fees)
-            self.stats.total_pnl += net_pnl
-            self.stats.daily_pnl += net_pnl
+            # Calculate ACTUAL P/L from balance change
+            actual_session_pnl = new_balance - self.stats.starting_balance
+
+            # Update trade count and win/loss
             self.stats.total_volume += position.notional
-            if net_pnl >= 0:
+            if gross_pnl >= 0:
                 self.stats.wins += 1
             else:
                 self.stats.losses += 1
-            state.cumulative_pnl += net_pnl
 
-            # Log the close with fees
+            # Log the close with ACTUAL balance
             side_str = "LONG" if position.side == Side.LONG else "SHORT"
             win_rate = self.stats.wins / self.stats.total_trades * 100 if self.stats.total_trades > 0 else 0
 
             print(f"CLOSE {symbol} [{reason}] {side_str} | Entry=${position.entry_price:.2f} Exit=${close_price:.2f}")
-            print(f"    Gross: ${gross_pnl:+.2f} | Fees: -${estimated_fees:.2f} | Net: ${net_pnl:+.2f}")
-            print(f"    Session: ${self.stats.total_pnl:+.2f} | W/L: {self.stats.wins}/{self.stats.losses} ({win_rate:.0f}%)")
+            print(f"    Gross P/L: ${gross_pnl:+.2f}")
+            print(f"    Balance: ${new_balance:.2f} | Session P/L: ${actual_session_pnl:+.2f}")
+            print(f"    Trades: {self.stats.total_trades} | W/L: {self.stats.wins}/{self.stats.losses} ({win_rate:.0f}%)")
 
             # Clear position
             state.position = None
@@ -1624,13 +1631,18 @@ class PointsFarmer:
 
         # Print summary stats
         win_rate = self.stats.wins / self.stats.total_trades * 100 if self.stats.total_trades > 0 else 0
+        actual_pnl = self.stats.current_balance - self.stats.starting_balance
         print("-" * 85)
         print(
             f"Signals: {self.stats.signals_detected} | "
             f"Trades: {self.stats.total_trades} | "
             f"W/L: {self.stats.wins}/{self.stats.losses} ({win_rate:.0f}%) | "
-            f"Volume: ${self.stats.total_volume:,.0f} | "
-            f"P/L: ${self.stats.total_pnl:+.2f}"
+            f"Volume: ${self.stats.total_volume:,.0f}"
+        )
+        print(
+            f"Balance: ${self.stats.current_balance:.2f} | "
+            f"Started: ${self.stats.starting_balance:.2f} | "
+            f"ACTUAL P/L: ${actual_pnl:+.2f}"
         )
         print("-" * 85)
 
