@@ -79,6 +79,13 @@ DEFAULT_LEVERAGE = list(LEVERAGE.values())[0]  # 50x for BTC
 TP_PCT = (TP_MARGIN_PCT / DEFAULT_LEVERAGE) + ROUND_TRIP_FEE_PCT  # 0.04% + 0.052% = 0.092%
 SL_PCT = SL_MARGIN_PCT / DEFAULT_LEVERAGE    # 0.08% on notional = 4% on margin
 
+# Trailing Stop Configuration (on margin %)
+TRAILING_ACTIVATION_MARGIN_PCT = 0.015   # Activate trailing after 1.5% margin profit (covers fees)
+TRAILING_DISTANCE_MARGIN_PCT = 0.01      # Trail 1% behind peak (on margin)
+# Convert to notional
+TRAILING_ACTIVATION_PCT = TRAILING_ACTIVATION_MARGIN_PCT / DEFAULT_LEVERAGE  # ~0.03% notional
+TRAILING_DISTANCE_PCT = TRAILING_DISTANCE_MARGIN_PCT / DEFAULT_LEVERAGE      # ~0.02% notional
+
 # Order Management
 MAX_ORDER_AGE = 30.0          # Cancel unfilled orders after 30 seconds
 MAX_POSITION_TIME = 300       # Hold up to 5 minutes
@@ -221,7 +228,8 @@ class PointsFarmer:
         binance_ticker = BINANCE_TICKERS[symbol].upper()
         print(f"Strategy: Replicate Binance {binance_ticker} price movement")
         print(f"Position size: {POSITION_SIZE_PCT*100}% of collateral × {leverage}x leverage")
-        print(f"Risk: TP={TP_PCT*100:.3f}% price move (={TP_MARGIN_PCT*100}% margin after fees) | SL={SL_PCT*100:.3f}%")
+        print(f"Risk: Hard TP={TP_MARGIN_PCT*100}% | SL={SL_MARGIN_PCT*100}% on margin")
+        print(f"Trailing: Activates at +{TRAILING_ACTIVATION_MARGIN_PCT*100}% | Trails {TRAILING_DISTANCE_MARGIN_PCT*100}% from peak")
         print(f"Fees: {ROUND_TRIP_FEE_PCT*100:.3f}% round trip (taker)")
         print(f"Max daily loss: ${MAX_DAILY_LOSS}")
         print(f"Momentum: {MOMENTUM_THRESHOLD*100}% move in {MOMENTUM_WINDOW}s triggers entry")
@@ -1162,12 +1170,35 @@ class PointsFarmer:
 
                     time_held = now - position.entry_time
 
-                    # ========== TAKE PROFIT: 2% on notional (10% on margin) ==========
+                    # ========== TRACK PEAK P/L FOR TRAILING STOP ==========
+                    if margin_pnl_pct > position.highest_margin_pnl_pct:
+                        position.highest_margin_pnl_pct = margin_pnl_pct
+
+                    # ========== TRAILING STOP ACTIVATION ==========
+                    if not position.trailing_active and margin_pnl_pct >= TRAILING_ACTIVATION_MARGIN_PCT:
+                        position.trailing_active = True
+                        print(f"[{symbol}] TRAILING ACTIVATED at {margin_pnl_pct*100:+.1f}% margin profit")
+
+                    # ========== TRAILING STOP CHECK ==========
+                    if position.trailing_active:
+                        # Calculate how far we've dropped from peak
+                        drawdown_from_peak = position.highest_margin_pnl_pct - margin_pnl_pct
+
+                        if drawdown_from_peak >= TRAILING_DISTANCE_MARGIN_PCT:
+                            # Close position - we've retraced enough from peak
+                            await self._close_position_emergency(
+                                symbol, position,
+                                f"TRAIL (peak {position.highest_margin_pnl_pct*100:.1f}%)",
+                                unrealized_pnl
+                            )
+                            continue
+
+                    # ========== HARD TAKE PROFIT (safety cap) ==========
                     if pnl_pct >= TP_PCT:
                         await self._close_position_emergency(symbol, position, "TP", unrealized_pnl)
                         continue
 
-                    # ========== STOP LOSS: 4% on notional (20% on margin) ==========
+                    # ========== STOP LOSS ==========
                     if pnl_pct <= -SL_PCT:
                         await self._close_position_emergency(symbol, position, "SL", unrealized_pnl)
                         continue
@@ -1180,10 +1211,9 @@ class PointsFarmer:
                     # Log status every 10 seconds
                     if int(time_held) % 10 == 0 and int(time_held) > 0:
                         side_str = "L" if position.side == Side.LONG else "S"
-                        # Show margin P/L % (what trader actually earns/loses)
-                        tp_margin = TP_PCT * leverage * 100  # e.g., 2% × 5 = 10%
-                        sl_margin = SL_PCT * leverage * 100  # e.g., 4% × 5 = 20%
-                        print(f"[{symbol}] {side_str} | {margin_pnl_pct*100:+.1f}% on margin (${unrealized_pnl:+.2f}) | TP={tp_margin:.0f}% SL=-{sl_margin:.0f}% | {time_held:.0f}s")
+                        trail_status = "TRAIL" if position.trailing_active else ""
+                        peak_info = f" peak={position.highest_margin_pnl_pct*100:.1f}%" if position.trailing_active else ""
+                        print(f"[{symbol}] {side_str} | {margin_pnl_pct*100:+.1f}% on margin (${unrealized_pnl:+.2f}){peak_info} | {trail_status} {time_held:.0f}s")
 
             except Exception as e:
                 print(f"Monitor error: {e}")
