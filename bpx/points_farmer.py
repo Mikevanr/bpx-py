@@ -1172,6 +1172,9 @@ class PointsFarmer:
                     leverage = position.leverage if position.leverage else LEVERAGE.get(symbol, 5)
                     margin_pnl_pct = pnl_pct * leverage
 
+                    # Calculate fee threshold on margin (must clear this to be profitable)
+                    fee_threshold_margin = ROUND_TRIP_FEE_PCT * leverage  # ~2.6% on margin with 50x
+
                     time_held = now - position.entry_time
 
                     # ========== TRACK PEAK P/L FOR TRAILING STOP ==========
@@ -1183,27 +1186,31 @@ class PointsFarmer:
                         position.trailing_active = True
                         print(f"[{symbol}] TRAILING ACTIVATED at {margin_pnl_pct*100:+.1f}% margin profit")
 
-                    # ========== TRAILING STOP CHECK (always active once triggered) ==========
+                    # ========== GRACE PERIOD - Skip all exit checks during grace period ==========
+                    if time_held < GRACE_PERIOD_SECONDS:
+                        # Only log occasionally during grace period
+                        if int(time_held) % 5 == 0:
+                            print(f"[{symbol}] Grace period: {time_held:.0f}s / {GRACE_PERIOD_SECONDS:.0f}s | {margin_pnl_pct*100:+.1f}% margin (peak={position.highest_margin_pnl_pct*100:.1f}%)")
+                        continue  # Skip ALL exit checks during grace period
+
+                    # ========== TRAILING STOP CHECK (only after grace period) ==========
                     if position.trailing_active:
                         # Calculate how far we've dropped from peak
                         drawdown_from_peak = position.highest_margin_pnl_pct - margin_pnl_pct
 
                         if drawdown_from_peak >= TRAILING_DISTANCE_MARGIN_PCT:
-                            # Close position - we've retraced enough from peak
-                            print(f"[{symbol}] CLOSING: Trailing stop hit (peak={position.highest_margin_pnl_pct*100:.1f}%, now={margin_pnl_pct*100:.1f}%, drop={drawdown_from_peak*100:.1f}%)")
-                            await self._close_position_emergency(
-                                symbol, position,
-                                f"TRAIL (peak {position.highest_margin_pnl_pct*100:.1f}%)",
-                                unrealized_pnl
-                            )
-                            continue
-
-                    # ========== GRACE PERIOD - Skip TP/SL checks during grace period ==========
-                    if time_held < GRACE_PERIOD_SECONDS:
-                        # Only log occasionally during grace period
-                        if int(time_held) % 5 == 0:
-                            print(f"[{symbol}] Grace period: {time_held:.0f}s / {GRACE_PERIOD_SECONDS:.0f}s | {margin_pnl_pct*100:+.1f}% margin")
-                        continue  # Skip TP/SL checks
+                            # Only close if current profit > fees (net positive)
+                            if margin_pnl_pct > fee_threshold_margin:
+                                print(f"[{symbol}] CLOSING: Trailing stop (peak={position.highest_margin_pnl_pct*100:.1f}%, now={margin_pnl_pct*100:.1f}%, drop={drawdown_from_peak*100:.1f}%)")
+                                await self._close_position_emergency(
+                                    symbol, position,
+                                    f"TRAIL (peak {position.highest_margin_pnl_pct*100:.1f}%)",
+                                    unrealized_pnl
+                                )
+                                continue
+                            else:
+                                # Don't close yet - profit doesn't cover fees
+                                print(f"[{symbol}] Trail triggered but profit ({margin_pnl_pct*100:.1f}%) < fees ({fee_threshold_margin*100:.1f}%), holding...")
 
                     # ========== HARD TAKE PROFIT (safety cap) ==========
                     if pnl_pct >= TP_PCT:
