@@ -86,6 +86,9 @@ TRAILING_DISTANCE_MARGIN_PCT = 0.01      # Trail 1% behind peak (on margin)
 TRAILING_ACTIVATION_PCT = TRAILING_ACTIVATION_MARGIN_PCT / DEFAULT_LEVERAGE  # ~0.03% notional
 TRAILING_DISTANCE_PCT = TRAILING_DISTANCE_MARGIN_PCT / DEFAULT_LEVERAGE      # ~0.02% notional
 
+# Grace period - don't trigger SL/TP for first N seconds (let position breathe)
+GRACE_PERIOD_SECONDS = 15.0  # Wait 15 seconds before checking TP/SL
+
 # Order Management
 MAX_ORDER_AGE = 30.0          # Cancel unfilled orders after 30 seconds
 MAX_POSITION_TIME = 300       # Hold up to 5 minutes
@@ -230,6 +233,7 @@ class PointsFarmer:
         print(f"Position size: {POSITION_SIZE_PCT*100}% of collateral × {leverage}x leverage")
         print(f"Risk: Hard TP={TP_MARGIN_PCT*100}% | SL={SL_MARGIN_PCT*100}% on margin")
         print(f"Trailing: Activates at +{TRAILING_ACTIVATION_MARGIN_PCT*100}% | Trails {TRAILING_DISTANCE_MARGIN_PCT*100}% from peak")
+        print(f"Grace period: {GRACE_PERIOD_SECONDS}s before TP/SL can trigger")
         print(f"Fees: {ROUND_TRIP_FEE_PCT*100:.3f}% round trip (taker)")
         print(f"Max daily loss: ${MAX_DAILY_LOSS}")
         print(f"Momentum: {MOMENTUM_THRESHOLD*100}% move in {MOMENTUM_WINDOW}s triggers entry")
@@ -1179,13 +1183,14 @@ class PointsFarmer:
                         position.trailing_active = True
                         print(f"[{symbol}] TRAILING ACTIVATED at {margin_pnl_pct*100:+.1f}% margin profit")
 
-                    # ========== TRAILING STOP CHECK ==========
+                    # ========== TRAILING STOP CHECK (always active once triggered) ==========
                     if position.trailing_active:
                         # Calculate how far we've dropped from peak
                         drawdown_from_peak = position.highest_margin_pnl_pct - margin_pnl_pct
 
                         if drawdown_from_peak >= TRAILING_DISTANCE_MARGIN_PCT:
                             # Close position - we've retraced enough from peak
+                            print(f"[{symbol}] CLOSING: Trailing stop hit (peak={position.highest_margin_pnl_pct*100:.1f}%, now={margin_pnl_pct*100:.1f}%, drop={drawdown_from_peak*100:.1f}%)")
                             await self._close_position_emergency(
                                 symbol, position,
                                 f"TRAIL (peak {position.highest_margin_pnl_pct*100:.1f}%)",
@@ -1193,18 +1198,28 @@ class PointsFarmer:
                             )
                             continue
 
+                    # ========== GRACE PERIOD - Skip TP/SL checks during grace period ==========
+                    if time_held < GRACE_PERIOD_SECONDS:
+                        # Only log occasionally during grace period
+                        if int(time_held) % 5 == 0:
+                            print(f"[{symbol}] Grace period: {time_held:.0f}s / {GRACE_PERIOD_SECONDS:.0f}s | {margin_pnl_pct*100:+.1f}% margin")
+                        continue  # Skip TP/SL checks
+
                     # ========== HARD TAKE PROFIT (safety cap) ==========
                     if pnl_pct >= TP_PCT:
+                        print(f"[{symbol}] CLOSING: Hard TP hit ({pnl_pct*100:.3f}% >= {TP_PCT*100:.3f}%)")
                         await self._close_position_emergency(symbol, position, "TP", unrealized_pnl)
                         continue
 
                     # ========== STOP LOSS ==========
                     if pnl_pct <= -SL_PCT:
+                        print(f"[{symbol}] CLOSING: SL hit ({pnl_pct*100:.3f}% <= -{SL_PCT*100:.3f}%)")
                         await self._close_position_emergency(symbol, position, "SL", unrealized_pnl)
                         continue
 
                     # ========== TIMEOUT ==========
                     if time_held >= MAX_POSITION_TIME:
+                        print(f"[{symbol}] CLOSING: Timeout ({time_held:.0f}s >= {MAX_POSITION_TIME}s)")
                         await self._close_position_emergency(symbol, position, "TIMEOUT", unrealized_pnl)
                         continue
 
