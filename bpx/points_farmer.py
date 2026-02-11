@@ -63,9 +63,11 @@ MOMENTUM_THRESHOLD = 0.003    # 0.3% move triggers entry
 MOMENTUM_WINDOW = 10.0        # 10 second window to detect momentum
 
 # Take Profit & Stop Loss (on margin, accounting for leverage AND fees)
-# Taker fee: 0.026% per side = 0.052% round trip
-TAKER_FEE_PCT = 0.00026       # 0.026% per side
-ROUND_TRIP_FEE_PCT = TAKER_FEE_PCT * 2  # 0.052% for entry + exit
+# Maker fee: 0.01% per side = 0.02% round trip (using postOnly to avoid speed bump)
+MAKER_FEE_PCT = 0.0001        # 0.01% per side (maker)
+TAKER_FEE_PCT = 0.00026       # 0.026% per side (taker - for exits)
+# Entry = maker, Exit = taker (market order for reliable close)
+ROUND_TRIP_FEE_PCT = MAKER_FEE_PCT + TAKER_FEE_PCT  # 0.036% for entry + exit
 
 # margin % = notional % × leverage
 TP_MARGIN_PCT = 0.02          # 2% profit on margin (AFTER fees)
@@ -236,7 +238,8 @@ class PointsFarmer:
         print(f"Risk: Hard TP={TP_MARGIN_PCT*100}% | SL={SL_MARGIN_PCT*100}% on margin")
         print(f"Trailing: Activates at +{TRAILING_ACTIVATION_MARGIN_PCT*100}% | Trails {TRAILING_DISTANCE_MARGIN_PCT*100}% from peak")
         print(f"Grace period: {GRACE_PERIOD_SECONDS}s before TP/SL can trigger")
-        print(f"Fees: {ROUND_TRIP_FEE_PCT*100:.3f}% round trip (taker)")
+        print(f"Fees: {ROUND_TRIP_FEE_PCT*100:.3f}% round trip (maker entry + taker exit)")
+        print(f"Entry: postOnly limit orders (avoids 100ms speed bump)")
         print(f"Max daily loss: ${MAX_DAILY_LOSS}")
         print(f"Momentum: {MOMENTUM_THRESHOLD*100}% move in {MOMENTUM_WINDOW}s triggers entry")
         print("=" * 60)
@@ -760,14 +763,21 @@ class PointsFarmer:
             # Format quantity based on symbol precision
             qty_str = str(quantity)
 
-            print(f"[{symbol}] MARKET {side_str} qty={qty_str} @ ~${entry_price:.2f} (${notional:.0f} notional)")
+            # Use postOnly limit order to AVOID the 100ms speed bump
+            # Price at mid to maximize fill chance while still being maker
+            limit_price = entry_price
+            limit_price_str = str(self._round_price(symbol, limit_price))
 
-            # Place market order for immediate execution (taker)
+            print(f"[{symbol}] LIMIT (postOnly) {side_str} qty={qty_str} @ ${limit_price:.2f} (${notional:.0f} notional)")
+
+            # Place limit order with postOnly to avoid 100ms speed bump
             result = await self.account.execute_order(
                 symbol=symbol,
                 side=order_side,
-                order_type="Market",
+                order_type="Limit",
                 quantity=qty_str,
+                price=limit_price_str,
+                post_only=True,
             )
 
             # Debug: log the API response
@@ -777,23 +787,27 @@ class PointsFarmer:
                 order_id = result["id"]
                 order_status = result.get("status", "")
 
-                # Market orders should fill immediately
                 if order_status == "Filled":
-                    fill_price = float(result.get("price") or result.get("avgPrice") or entry_price)
+                    # Immediate fill (unlikely with postOnly but possible)
+                    fill_price = float(result.get("price") or result.get("avgPrice") or limit_price)
                     fill_qty = float(result.get("executedQuantity") or quantity)
                     await self._on_entry_filled(symbol, side, fill_price, fill_qty, order_id, margin, leverage)
+                elif order_status == "Cancelled":
+                    # postOnly rejected - would have taken liquidity
+                    print(f"[{symbol}] postOnly rejected (would cross spread), retrying...")
                 else:
-                    # Rare: market order pending (shouldn't happen)
+                    # Order is pending - wait for fill via websocket or sync
                     state.pending_entry_order_id = order_id
                     state.pending_entry_time = time.time()
                     self._pending_fills[order_id] = {
                         "symbol": symbol,
                         "side": side,
                         "quantity": quantity,
-                        "price": entry_price,
+                        "price": limit_price,
                         "margin": margin,
                         "leverage": leverage,
                     }
+                    print(f"[{symbol}] Order pending, waiting for fill...")
             else:
                 error_msg = result.get("message", str(result)) if isinstance(result, dict) else str(result)
                 print(f"[{symbol}] Order error: {error_msg}")
